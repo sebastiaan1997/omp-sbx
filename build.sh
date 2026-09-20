@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build and load the omp-sbx template image into the sbx runtime.
+# Build and load the interactive and configure-only images into the sbx runtime.
 #
 # OMP_VERSION picks the omp release to bake in: unset uses the pin below,
 # X.Y.Z pins explicitly, and "latest" resolves the newest GitHub release.
@@ -81,6 +81,7 @@ fi
 
 OMP_VERSION="${OMP_VERSION:?could not determine OMP_VERSION}"
 IMAGE="${OMP_SBX_IMAGE:-omp-sbx:latest}"
+CONFIGURE_IMAGE="${OMP_SBX_CONFIGURE_IMAGE:-omp-sbx-configure:latest}"
 
 echo ">> building ${IMAGE} (omp v${OMP_VERSION})"
 docker build \
@@ -89,9 +90,21 @@ docker build \
   -f "${DIR}/sbx-kit/Dockerfile" \
   "${DIR}"
 
+echo ">> building ${CONFIGURE_IMAGE} (omp v${OMP_VERSION})"
+docker build \
+  --build-arg "OMP_VERSION=${OMP_VERSION}" \
+  -t "${CONFIGURE_IMAGE}" \
+  -f "${DIR}/sbx-configure-kit/Dockerfile" \
+  "${DIR}/sbx-configure-kit"
+
 echo ">> saving + loading into sbx runtime"
-docker image save "${IMAGE}" -o /tmp/omp-sbx.tar
-if ! sbx template load /tmp/omp-sbx.tar; then
+MAIN_ARCHIVE=/tmp/omp-sbx.tar
+CONFIGURE_ARCHIVE=/tmp/omp-sbx-configure.tar
+docker image save "${IMAGE}" -o "$MAIN_ARCHIVE"
+docker image save "${CONFIGURE_IMAGE}" -o "$CONFIGURE_ARCHIVE"
+if ! sbx template load "$MAIN_ARCHIVE" ||
+   ! sbx template load "$CONFIGURE_ARCHIVE"
+then
   if [ -t 2 ]; then C_BRED=$'\033[1;31m'; C_RST=$'\033[0m'; else C_BRED=''; C_RST=''; fi
   echo "" >&2
   echo "${C_BRED}ERROR: sbx template load failed.${C_RST}" >&2
@@ -101,18 +114,64 @@ if ! sbx template load /tmp/omp-sbx.tar; then
   echo "  sbx login" >&2
   echo "" >&2
   echo "${C_BRED}then re-run ./build.sh${C_RST}" >&2
-  rm -f /tmp/omp-sbx.tar
+  rm -f "$MAIN_ARCHIVE" "$CONFIGURE_ARCHIVE"
   exit 1
 fi
+rm -f "$MAIN_ARCHIVE" "$CONFIGURE_ARCHIVE"
 
 echo ">> verifying"
 VERIFY_NAME="omp-verify"
-cleanup_verify() { sbx rm -f "$VERIFY_NAME" 2>/dev/null || true; }
+VERIFY_DENY_NAME="omp-verify-deny"
+VERIFY_CONFIGURE_NAME="omp-verify-configure"
+POLICY_DIR="$(mktemp -d)"
+DENY_POLICY_DIR="$(mktemp -d)"
+# Generated, not copied from the repo: verification must not depend on an
+# optional project policy file that may be absent or edited.
+printf 'schemaVersion: 1\nallowedImages:\n  - docker.io/docker/sandbox-templates:shell-docker-nightly\n' > "$POLICY_DIR/.omp-sbx-docker-images.yaml"
+printf 'schemaVersion: 1\nallowedImages: []\n' > "$DENY_POLICY_DIR/.omp-sbx-docker-images.yaml"
+chmod 0444 "$POLICY_DIR/.omp-sbx-docker-images.yaml" "$DENY_POLICY_DIR/.omp-sbx-docker-images.yaml"
+cleanup_verify() {
+  sbx rm -f "$VERIFY_NAME" >/dev/null 2>&1 || true
+  sbx rm -f "$VERIFY_DENY_NAME" >/dev/null 2>&1 || true
+  sbx rm -f "$VERIFY_CONFIGURE_NAME" >/dev/null 2>&1 || true
+  rm -rf "$POLICY_DIR" "$DENY_POLICY_DIR"
+}
 trap cleanup_verify EXIT
-cleanup_verify
-sbx create -q --template "${IMAGE}" --name "$VERIFY_NAME" "${DIR}/sbx-kit" /tmp
+cleanup_sandboxes() {
+  sbx rm -f "$VERIFY_NAME" >/dev/null 2>&1 || true
+  sbx rm -f "$VERIFY_DENY_NAME" >/dev/null 2>&1 || true
+  sbx rm -f "$VERIFY_CONFIGURE_NAME" >/dev/null 2>&1 || true
+}
+cleanup_sandboxes
+sbx create -q --template "${CONFIGURE_IMAGE}" --name "$VERIFY_CONFIGURE_NAME" \
+  "${DIR}/sbx-configure-kit" /tmp
 sleep 2
+sbx exec -w /home/agent "$VERIFY_CONFIGURE_NAME" omp --version
+sbx exec -w /home/agent "$VERIFY_CONFIGURE_NAME" sh -c 'test ! -S /var/run/docker.sock'
+sbx rm -f "$VERIFY_CONFIGURE_NAME" >/dev/null 2>&1
+
+sbx create -q --template "${IMAGE}" --name "$VERIFY_NAME" \
+  "${DIR}/sbx-kit" /tmp "${POLICY_DIR}:ro"
+sleep 2
+sbx exec -w /home/agent "$VERIFY_NAME" sh -lc 'for _ in $(seq 1 60); do if test -S /var/run/docker.sock && /usr/local/libexec/docker-real version >/dev/null 2>&1 && /usr/local/libexec/docker-real ps >/dev/null 2>&1; then exit 0; fi; sleep 0.5; done; echo "Docker daemon did not become ready inside sandbox" >&2; exit 1'
 sbx exec -w /home/agent "$VERIFY_NAME" omp-init.sh --version
+sbx exec -w /home/agent "$VERIFY_NAME" sh -lc 'docker info >/dev/null'
+sbx exec -w /home/agent "$VERIFY_NAME" sh -lc 'output=$(docker pull alpine:latest 2>&1) && exit 1; printf "%s\n" "$output" | grep -q "not approved by omp-sbx policy"'
+sbx exec -w /home/agent "$VERIFY_NAME" sh -lc 'python3 -c '"'"'import json; data=json.load(open("/var/lib/omp-sbx-policy/policy.json")); assert data["images"] == ["docker.io/docker/sandbox-templates:shell-docker-nightly"]'"'"''
+sbx exec -w /home/agent "$VERIFY_NAME" sh -lc "grep -F 'host $POLICY_DIR virtiofs ro,' /proc/mounts >/dev/null; if printf 'tamper\n' > '$POLICY_DIR/.omp-sbx-docker-images.yaml' 2>/dev/null; then echo 'read-only policy was writable' >&2; exit 1; fi"
+# sudo is passwordless here, so root is the case that decides whether the host
+# really owns the policy file.
+sbx exec -w /home/agent "$VERIFY_NAME" sh -lc "if sudo cp /etc/hostname '$POLICY_DIR/.omp-sbx-docker-images.yaml' 2>/dev/null; then echo 'read-only policy was writable by root' >&2; exit 1; fi; sudo test -w '$POLICY_DIR/.omp-sbx-docker-images.yaml' && { echo 'read-only policy reports writable' >&2; exit 1; }; exit 0"
+sbx exec -w /home/agent "$VERIFY_NAME" sh -lc 'd=$(mktemp -d); printf "schemaVersion: 1\nallowedImages: []\n" >"$d/empty.yaml"; /usr/local/libexec/docker-image-policy.py compile --input "$d/empty.yaml" --output-dir "$d/empty"; python3 -c '"'"'import json,sys; assert json.load(open(sys.argv[1]))["images"] == []'"'"' "$d/empty/policy.json"; printf "schemaVersion: 1\nallowedImages: []\nextra: true\n" >"$d/bad.yaml"; ! /usr/local/libexec/docker-image-policy.py compile --input "$d/bad.yaml" --output-dir "$d/bad"; printf "schemaVersion: 1\nallowedImages:\n  - alpine\n  - docker.io/library/alpine:latest\n" >"$d/duplicate.yaml"; ! /usr/local/libexec/docker-image-policy.py compile --input "$d/duplicate.yaml" --output-dir "$d/duplicate"'
+sbx exec -w /home/agent "$VERIFY_NAME" sh -lc 'd=$(mktemp -d); printf "package main\nimport \"fmt\"\nfunc main(){fmt.Println(\"omp-docker-policy-smoke\")}\n" >"$d/main.go"; (cd "$d" && CGO_ENABLED=0 GO111MODULE=off go build -o hello main.go); printf "FROM scratch\nCOPY hello /hello\nENTRYPOINT [\"/hello\"]\n" >"$d/Dockerfile"; docker build -t policy-smoke "$d"; test "$(docker run --rm policy-smoke)" = omp-docker-policy-smoke; output=$(/usr/local/libexec/docker-real build -t raw-build "$d" 2>&1) && exit 1; printf "%s\n" "$output" | grep -q "requires the omp-sbx Build Policy wrapper"; printf "FROM alpine:latest\n" >"$d/Dockerfile"; output=$(docker build -t denied-build "$d" 2>&1) && exit 1; printf "%s\n" "$output" | grep -q "not approved by omp-sbx policy"; output=$(docker load </dev/null 2>&1) && exit 1; printf "%s\n" "$output" | grep -q "image load is not allowed"'
+sbx exec -w /home/agent "$VERIFY_NAME" sh -lc 'test "$PUPPETEER_EXECUTABLE_PATH" = /usr/local/bin/chromium && test -x "$PUPPETEER_EXECUTABLE_PATH" && "$PUPPETEER_EXECUTABLE_PATH" --headless --no-sandbox --disable-gpu --disable-dev-shm-usage --dump-dom "data:text/html,<p>omp-browser-smoke</p>" 2>/dev/null | grep -q "omp-browser-smoke"'
+
+sbx create -q --template "${IMAGE}" --name "$VERIFY_DENY_NAME" \
+  "${DIR}/sbx-kit" /tmp "${DENY_POLICY_DIR}:ro"
+sleep 2
+sbx exec -w /home/agent "$VERIFY_DENY_NAME" sh -lc 'for _ in $(seq 1 60); do if test -S /var/run/docker.sock && /usr/local/libexec/docker-real version >/dev/null 2>&1; then exit 0; fi; sleep 0.5; done; exit 1'
+sbx exec -w /home/agent "$VERIFY_DENY_NAME" omp-init.sh --version
+sbx exec -w /home/agent "$VERIFY_DENY_NAME" sh -lc 'python3 -c '"'"'import json; assert json.load(open("/var/lib/omp-sbx-policy/policy.json"))["images"] == []'"'"'; output=$(docker pull alpine:latest 2>&1) && exit 1; printf "%s\n" "$output" | grep -q "not approved by omp-sbx policy"; d=$(mktemp -d); printf "package main\nimport \"fmt\"\nfunc main(){fmt.Println(\"deny-all-local-smoke\")}\n" >"$d/main.go"; (cd "$d" && CGO_ENABLED=0 GO111MODULE=off go build -o hello main.go); printf "FROM scratch\nCOPY hello /hello\nENTRYPOINT [\"/hello\"]\n" >"$d/Dockerfile"; docker build -t deny-all-local "$d"; test "$(docker run --rm deny-all-local)" = deny-all-local-smoke'
 cleanup_verify
 trap - EXIT
 echo "✓ done"

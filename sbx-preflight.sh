@@ -124,6 +124,52 @@ sandbox_name_for() {
   esac
 }
 
+# Prepares the Docker image policy that the guest may trust. The project file is
+# only a proposed source: the authoritative snapshot lives outside the writable
+# workspace and changes solely through an explicit refresh.
+prepare_docker_image_policy() {
+  local workspace="$1" sandbox_name="$2" refresh="$3"
+  local workspace_real source state_root state_dir snapshot origin temporary origin_temporary
+
+  workspace_real="$(cd "$workspace" && pwd -P)"
+  source="$workspace_real/.omp-sbx-docker-images.yaml"
+  state_root="${XDG_STATE_HOME:-$HOME/.local/state}/omp-sbx/docker-image-policies"
+  state_dir="$state_root/$sandbox_name"
+  snapshot="$state_dir/.omp-sbx-docker-images.yaml"
+  origin="$state_dir/.policy-origin"
+
+  mkdir -p "$state_dir"
+  chmod 0700 "$state_root" "$state_dir"
+
+  if [ -f "$snapshot" ] && [ "$refresh" != true ]; then
+    DOCKER_IMAGE_POLICY_DIR="$state_dir"
+    DOCKER_IMAGE_POLICY_ORIGIN="$(cat "$origin" 2>/dev/null || printf '%s' snapshot)"
+    return 0
+  fi
+
+  temporary="$(mktemp "$state_dir/.policy.XXXXXX")"
+  if [ ! -e "$source" ]; then
+    printf 'schemaVersion: 1\nallowedImages: []\n' > "$temporary"
+    DOCKER_IMAGE_POLICY_ORIGIN="deny-all"
+  else
+    if [ ! -f "$source" ] || [ -L "$source" ]; then
+      rm -f "$temporary"
+      log "${C_RED}omp-sbx: Docker image policy must be a regular non-symlink file: ${source}${C_RST}"
+      return 1
+    fi
+    cp "$source" "$temporary"
+    DOCKER_IMAGE_POLICY_ORIGIN="$source"
+  fi
+
+  chmod 0444 "$temporary"
+  mv "$temporary" "$snapshot"
+  origin_temporary="$(mktemp "$state_dir/.origin.XXXXXX")"
+  printf '%s\n' "$DOCKER_IMAGE_POLICY_ORIGIN" > "$origin_temporary"
+  chmod 0444 "$origin_temporary"
+  mv "$origin_temporary" "$origin"
+  DOCKER_IMAGE_POLICY_DIR="$state_dir"
+}
+
 # Removes a sandbox that was created from a different kit directory. Returns 0
 # when it removed one, so the caller can treat the sandbox as absent.
 #

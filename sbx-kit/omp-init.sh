@@ -5,6 +5,10 @@
 # hook runs in parallel with omp itself and can lose that race.
 set -euo pipefail
 
+# Install the per-project Docker image policy before OMP can issue Docker
+# commands. The helper owns daemon/plugin convergence and fails closed.
+sudo -n /usr/local/libexec/docker-policy-start.sh
+
 # ── Host config mount symlink ────────────────────────────────────────────────
 # The host ~/.omp lands at its own absolute path (e.g. /Users/ww/.omp), so
 # ~/.omp has to point at it.
@@ -178,8 +182,53 @@ case "$MCP_GATEWAY_OPT" in
     ;;
 esac
 
-# The startup hook turns this path into a symlink to the host workspace, so
-# enter it here rather than declaring it as the image WORKDIR - sbx's own
-# setup execs run before the hook and would fail on a moving path.
+
+# ── Shared SBX agent skills ──────────────────────────────────────────────────
+SBX_SKILLS_MOUNT=""
+
+for _ in $(seq 1 100); do
+    SBX_SKILLS_MOUNT="$(
+        awk '$3 == "virtiofs" {print $2}' /proc/mounts \
+            | grep '/sandboxes/sandboxes/agent-skills$' \
+            | head -n 1 || true
+    )"
+
+    if [ -n "$SBX_SKILLS_MOUNT" ] && [ -d "$SBX_SKILLS_MOUNT" ]; then
+        break
+    fi
+
+    sleep 0.05
+done
+
+if [ -n "$SBX_SKILLS_MOUNT" ] && [ -d "$SBX_SKILLS_MOUNT" ]; then
+    mkdir -p "$HOME/.agents"
+
+    if [ -e "$HOME/.agents/skills" ] && [ ! -L "$HOME/.agents/skills" ]; then
+        rm -rf "$HOME/.agents/skills"
+    fi
+
+    ln -sfn "$SBX_SKILLS_MOUNT" "$HOME/.agents/skills"
+
+    echo "omp-sbx: shared skills: $HOME/.agents/skills -> $SBX_SKILLS_MOUNT" >&2
+else
+    echo "omp-sbx: warning: shared SBX skills mount not found" >&2
+fi
+
+# The startup hook turns this path into a symlink to the host workspace.
 cd /home/agent/workspace
+# Keep the bundled binary current on every sandbox start. The updater already
+# verifies release metadata and the downloaded binary before replacing omp.
+# An explicit `omp update` is passed through once rather than checked twice.
+if [ "${1:-}" != "update" ]; then
+  if OMP_UPDATE_OUTPUT="$(omp update 2>&1)"; then
+    if [ -n "$OMP_UPDATE_OUTPUT" ]; then
+      printf '%s\n' "$OMP_UPDATE_OUTPUT" >&2
+    fi
+  else
+    OMP_UPDATE_STATUS=$?
+    printf 'omp-sbx: warning: automatic omp update failed (exit %s)\n%s\n' \
+      "$OMP_UPDATE_STATUS" "$OMP_UPDATE_OUTPUT" >&2
+  fi
+fi
+
 exec omp "${OMP_ARGS[@]}" "$@"

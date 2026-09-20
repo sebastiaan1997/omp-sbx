@@ -1,0 +1,28 @@
+schemaVersion: "2"
+kind: sandbox
+name: omp-configure
+displayName: OMP Configure
+description: Minimal noninteractive sandbox for discovering models and writing host OMP configuration.
+
+sandbox:
+  image: "omp-sbx-configure:latest"
+  entrypoint: ["/usr/local/bin/omp-configure-init"]
+
+permissions:
+  network:
+    allow:
+      - "api.openai.com:443"
+      - "auth.openai.com:443"
+      - "chatgpt.com:443"
+      - "*.opencode.ai:443"
+      - "bedrock-runtime.us-east-1.amazonaws.com:443"
+      - "bedrock.us-east-1.amazonaws.com:443"
+      - "oidc.us-east-1.amazonaws.com:443"
+      - "portal.sso.us-east-1.amazonaws.com:443"
+      - "sts.us-east-1.amazonaws.com:443"
+      - "host.docker.internal:*"
+
+environment:
+  variables:
+    HOME: "/home/agent"
+    PI_CONFIG_DIR: ".omp"

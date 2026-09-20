@@ -23,12 +23,12 @@ _fail() { echo "  FAIL  $1"; FAIL=$(( FAIL + 1 )); }
 _head() { echo; echo "── $1 ──"; }
 
 # ── 1. Env: cert-error bypass must be off ─────────────────────────────────────
-_head "1. AGENT_BROWSER_IGNORE_HTTPS_ERRORS"
-val="${AGENT_BROWSER_IGNORE_HTTPS_ERRORS:-}"
+_head "1. PUPPETEER_PROXY_IGNORE_CERT_ERRORS"
+val="${PUPPETEER_PROXY_IGNORE_CERT_ERRORS:-}"
 if [ "$val" = "false" ] || [ -z "$val" ]; then
-  _pass "AGENT_BROWSER_IGNORE_HTTPS_ERRORS=${val:-<unset>}  (cert validation is enabled)"
+  _pass "PUPPETEER_PROXY_IGNORE_CERT_ERRORS=${val:-<unset>}  (cert validation is enabled)"
 else
-  _fail "AGENT_BROWSER_IGNORE_HTTPS_ERRORS=${val}  (blanket bypass is ON — this is the bug)"
+  _fail "PUPPETEER_PROXY_IGNORE_CERT_ERRORS=${val}  (blanket bypass is ON — this is the bug)"
 fi
 
 # ── 2. Proxy CA cert exists ───────────────────────────────────────────────────
@@ -134,8 +134,8 @@ echo
 
 if [ "$FAIL" -gt 0 ]; then
   echo "  One or more checks failed."
-  echo "  If AGENT_BROWSER_IGNORE_HTTPS_ERRORS is not 'false', rebuild from the"
-  echo "  hardened spec.yaml and recreate the sandbox."
+  echo "  If PUPPETEER_PROXY_IGNORE_CERT_ERRORS is not 'false' or unset,"
+  echo "  remove that override and recreate the sandbox."
   echo "  If the proxy CA is missing, check sbx startup logs — it should inject"
   echo "  /usr/local/share/ca-certificates/proxy-ca.crt before the agent starts."
   echo

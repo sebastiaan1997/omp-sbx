@@ -1,3 +1,10 @@
 *
 !Dockerfile
 !spec.yaml
+!install-native-lsps.sh
+!omp-init.sh
+!docker-image-authz.go
+!docker-image-policy.py
+!docker-policy-start.sh
+!docker-policy-cli.sh
+!extensions/

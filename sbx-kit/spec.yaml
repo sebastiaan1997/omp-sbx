@@ -18,6 +18,25 @@ agentInstructions:
     from the host — agent.db, managed-skills, memories, and sessions persist
     across sandbox restarts.
 
+    Docker is available inside the sandbox through the sandbox-local daemon at
+    `/var/run/docker.sock`. Do not mount or use the host Docker socket; `docker ps`
+    should show containers that belong to this sbx microVM only.
+
+    External Docker images are restricted by a host-approved snapshot of the
+    optional project `.omp-sbx-docker-images.yaml`. The snapshot is outside the
+    writable workspace, mounted read-only, and enforced by Docker AuthZ. If no
+    project policy was approved, every external image is denied. Project edits
+    do not change the active policy; the user must run the host launcher with
+    `--refresh-image-policy`, which recreates the sandbox.
+
+    Use unqualified names or the `local/` prefix for local build outputs. Use
+    `docker buildx bake -f compose.yaml` for Compose builds; `docker compose
+    build` and `docker compose up --build` are rejected because Compose cannot
+    require the sandbox Buildx policy.
+
+    This image policy is an operational guardrail. Passwordless `sudo` can
+    reconfigure Docker, and Docker AuthZ does not cover native/upgraded gRPC.
+
     GitHub authentication is forwarded from the host: `gh` CLI commands work
     directly, and `git push` over HTTPS uses the gh credential helper (no
     separate token or SSH setup needed). If `gh auth status` fails, the host's
@@ -31,31 +50,33 @@ agentInstructions:
     working once the SSO client registration lapses, which takes weeks. If an AWS
     call reports an expired or missing token, run
     `aws sso login --no-browser --use-device-code --profile "$OMP_SBX_AWS_PROFILE"`
-    and give the printed URL and code to the user to open - no browser runs inside
-    this sandbox, so never try to open it here. Keep `--use-device-code`: without
-    it the CLI prints a URL that redirects to a port inside this sandbox, which
-    the user's browser cannot reach.
+    and give the printed URL and code to the user to open. The sandbox's
+    headless browser cannot complete an interactive SSO login on the user's
+    behalf. Keep `--use-device-code`: without it the CLI prints a URL that
+    redirects to a port inside this sandbox, which the user's browser cannot
+    reach.
 
-    The omp `browser` tool (Puppeteer/Chromium) cannot spawn inside this microVM
-    (ENOEXEC on the bundled chrome-linux64 binary). For browser automation use the
-    installed `agent-browser` CLI instead (`agent-browser open <url>`, then
-    `snapshot`, `click @eN`, `screenshot`, etc.). It uses a real Chromium
-    installed via Playwright (`AGENT_BROWSER_EXECUTABLE_PATH=/usr/local/bin/chromium`).
-    The sbx TLS proxy intercepts HTTPS. The proxy CA is injected into the
-    container trust store at runtime by sbx, so `agent-browser` validates
-    certificates normally — no cert-error bypass needed. For fetching static web content
-    (articles, docs, JSON, PDFs) prefer the `read` tool on a URL — no browser needed.
+    OMP's Eval `browser` API is enabled and uses the Chromium installed at
+    `/usr/local/bin/chromium`. Open it with `await browser.open(...)`; use
+    `observe`, `click`, `fill`, and `screenshot` on the returned tab. The sbx
+    TLS proxy intercepts HTTPS. Its CA is injected into the container trust
+    store at runtime, so Chromium validates certificates normally; do not
+    enable a certificate-error bypass. For static web content (articles, docs,
+    JSON, PDFs), prefer the `read` tool on a URL.
 
 # ── Network ──────────────────────────────────────────────────────────────────
 permissions:
   network:
     allow:
       # Model providers - add the ones you use
-      - "api.anthropic.com:443"
+      # - "api.anthropic.com:443"
       - "api.openai.com:443"
-      - "openrouter.ai:443"
-      - "*.openrouter.ai:443"
-      - "opencode.ai:443"
+      - "auth.openai.com:443"
+      - "chatgpt.com:443"
+      # - "openrouter.ai:443"
+      # - "*.openrouter.ai:443"
+      # - "opencode.ai:443"
+
       - "*.opencode.ai:443"
       # Amazon Bedrock, us-east-1. Add the hosts for another region to use it.
       - "bedrock-runtime.us-east-1.amazonaws.com:443"
@@ -65,7 +86,8 @@ permissions:
       - "oidc.us-east-1.amazonaws.com:443"
       - "portal.sso.us-east-1.amazonaws.com:443"
       - "sts.us-east-1.amazonaws.com:443"
-      # omp release downloads and self-update
+      # omp release metadata, downloads and self-update
+      - "api.github.com:443"
       - "github.com:443"
       - "*.githubusercontent.com:443"
       - "raw.githubusercontent.com:443"
@@ -90,9 +112,8 @@ environment:
     PI_CONFIG_DIR: ".omp"
     HOME: "/home/agent"
     GH_CONFIG_DIR: "/home/agent/.config/gh"
-    AGENT_BROWSER_EXECUTABLE_PATH: "/usr/local/bin/chromium"
-    # Keep validation on: sbx puts its proxy CA in the OS trust store.
-    AGENT_BROWSER_IGNORE_HTTPS_ERRORS: "false"
+    # Force OMP/Puppeteer to use the architecture-native Chromium in the image.
+    PUPPETEER_EXECUTABLE_PATH: "/usr/local/bin/chromium"
     # botocore ships its own CA bundle and ignores the OS trust store, so every
     # AWS call fails against the sbx TLS proxy until it is pointed back at it.
     AWS_CA_BUNDLE: "/etc/ssl/certs/ca-certificates.crt"

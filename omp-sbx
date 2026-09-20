@@ -4,6 +4,7 @@
 #
 #   omp-sbx                 reconnect to this directory's sandbox, or create it
 #   omp-sbx --new           destroy it and start fresh
+#   omp-sbx --refresh-image-policy  approve policy changes and recreate
 #   omp-sbx --version       passthrough omp flags
 #   omp-sbx "fix the bug"   one-shot prompt
 #
@@ -21,6 +22,11 @@ while [ -L "$SCRIPT_PATH" ]; do
   case "$SCRIPT_PATH" in /*) ;; *) SCRIPT_PATH="$SCRIPT_DIR/$SCRIPT_PATH" ;; esac
 done
 REPO_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+
+if [ "${1:-}" = "--configure" ]; then
+  shift
+  exec "$REPO_DIR/omp-sbx-configure-models" "$@"
+fi
 KIT_DIR="${OMP_SBX_KIT:-$REPO_DIR/sbx-kit}"
 TEMPLATE="${OMP_SBX_TEMPLATE:-omp-sbx:latest}"
 
@@ -35,11 +41,13 @@ log() { printf '%s\n' "$*" >&2; }
 
 # ── Parse flags ──────────────────────────────────────────────────────────────
 FORCE_NEW=false
+REFRESH_IMAGE_POLICY=false
 SKIP_PAUSE=false
 OMP_ARGS=()
 for arg in "$@"; do
   case "$arg" in
-    --new)  FORCE_NEW=true ;;
+    --new) FORCE_NEW=true ;;
+    --refresh-image-policy) REFRESH_IMAGE_POLICY=true ;;
     --yes|-y) SKIP_PAUSE=true ;;
     *)      OMP_ARGS+=("$arg") ;;
   esac
@@ -61,6 +69,11 @@ fi
 MOUNTS=("$HOME/.omp")
 if [ -d "$HOME/.config/gh" ]; then
   MOUNTS+=("$HOME/.config/gh")
+fi
+
+SBX_SKILLS="${XDG_STATE_HOME:-$HOME/.local/state}/sandboxes/sandboxes/agent-skills"
+if [ -d "$SBX_SKILLS" ]; then
+  MOUNTS+=("$SBX_SKILLS:ro")
 fi
 
 # In a linked worktree, .git is a file pointing at an absolute host path
@@ -106,8 +119,12 @@ sandbox_exists() {
   sbx ls 2>/dev/null | awk -v name="$1" 'NR>1 && $1 == name {found=1} END {exit !found}'
 }
 
-if $FORCE_NEW && sandbox_exists "$SANDBOX_NAME"; then
-  log "${C_DIM}omp-sbx: removing existing sandbox '$SANDBOX_NAME' (--new)${C_RST}"
+if { $FORCE_NEW || $REFRESH_IMAGE_POLICY; } && sandbox_exists "$SANDBOX_NAME"; then
+  if $REFRESH_IMAGE_POLICY; then
+    log "${C_DIM}omp-sbx: recreating sandbox '$SANDBOX_NAME' with refreshed Docker image policy${C_RST}"
+  else
+    log "${C_DIM}omp-sbx: removing existing sandbox '$SANDBOX_NAME' (--new)${C_RST}"
+  fi
   sbx rm -f "$SANDBOX_NAME" >/dev/null 2>&1 || true
 fi
 
@@ -119,10 +136,14 @@ if $EXISTS && drop_stale_sandbox "$SANDBOX_NAME" "$KIT_DIR"; then
   EXISTS=false
 fi
 
+prepare_docker_image_policy "$WORKDIR" "$SANDBOX_NAME" "$REFRESH_IMAGE_POLICY"
+MOUNTS+=("$DOCKER_IMAGE_POLICY_DIR:ro")
+
 # ── Banner ───────────────────────────────────────────────────────────────────
 log "${C_BOLD}${C_CYAN}╭─ omp-sbx ─────────────────────────────────────────────────╮${C_RST}"
 log "${C_CYAN}│${C_RST} template  : ${TEMPLATE}"
 log "${C_CYAN}│${C_RST} workspace : ${WORKDIR}  ${C_DIM}→ /home/agent/workspace${C_RST}"
+log "${C_CYAN}│${C_RST} images    : ${DOCKER_IMAGE_POLICY_ORIGIN}  ${C_DIM}(snapshot: ${DOCKER_IMAGE_POLICY_DIR})${C_RST}"
 log "${C_CYAN}│${C_RST} config    : ${HOME}/.omp  ${C_DIM}(shared, via symlink)${C_RST}"
 if [ -d "$HOME/.config/gh" ]; then
   log "${C_CYAN}│${C_RST} gh session: ${HOME}/.config/gh  ${C_DIM}(shared, via symlink)${C_RST}"

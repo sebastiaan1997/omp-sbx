@@ -120,11 +120,11 @@ export default function (pi: Pi): void {
 	/**
 	 * Runs the device-code login, reporting the URL through the chat.
 	 *
-	 * No browser runs in the sandbox, so the CLI's own "opening your browser"
-	 * path is useless here. --no-browser prints a URL and then blocks, polling,
-	 * until the approval lands - which is exactly the wait this needs. pi.exec
-	 * buffers until exit, so it cannot show a URL that only matters while the
-	 * process is still running.
+	 * The sandbox has no interactive browser session for user authentication, so
+	 * the CLI's own "opening your browser" path is useless here. --no-browser
+	 * prints a URL and then blocks, polling, until the approval lands - which is
+	 * exactly the wait this needs. pi.exec buffers until exit, so it cannot show
+	 * a URL that only matters while the process is still running.
 	 *
 	 * --use-device-code is required, not a preference. The CLI otherwise runs the
 	 * PKCE flow, whose redirect_uri is a loopback port inside this sandbox: the

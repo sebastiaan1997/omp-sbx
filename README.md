@@ -9,6 +9,7 @@ Run the [omp coding agent](https://omp.sh) (oh-my-pi) inside a [Docker sbx](http
 ## What it does
 
 - Launches omp inside a Docker sbx microVM — sbx handles all security (non-root user, network policies, secret proxy, resource limits)
+- Provides a private Docker Engine inside the sbx microVM, so `/var/run/docker.sock`, `docker ps`, `docker build`, and Docker Compose target sandbox-local containers/images instead of the host daemon
 - Bind-mounts your `~/.omp` (agent.db, managed-skills, memories, sessions) so state persists across sandbox restarts
 - Sandboxes are per-directory: running from the same cwd reconnects to the same sandbox
 - Recovers automatically after a force-quit: if the sandbox is left stopped (or its agent wedged), the launcher re-attaches, then stops+restarts, and as a last resort recreates the sandbox — your omp session resumes from the shared `~/.omp` either way
@@ -28,8 +29,11 @@ sbx policy set-default balanced
 git clone https://github.com/mikeatlas/omp-sbx.git ~/src/github.com/mikeatlas/omp-sbx
 cd ~/src/github.com/mikeatlas/omp-sbx
 
-# Build + load the template image into sbx
+# Build + load the interactive and configure-only template images into sbx
 ./build.sh
+
+# Rebuild only the minimal configure template when needed
+./build-configure.sh
 
 # Symlink the launcher onto your PATH
 ln -sf "$PWD/omp-sbx" ~/.local/bin/omp-sbx
@@ -46,27 +50,215 @@ omp --new              # destroy + create fresh sandbox
 omp --yes              # skip the pre-launch "press any key" pause
 omp --version          # passthrough flags to omp
 omp "fix the bug"      # one-shot prompt
+omp --configure          # choose global fast / standard / deep model defaults
+omp --configure --dry-run
+omp --configure --fast openai-codex/gpt-5.6-luna \
+  --standard openai-codex/gpt-5.6-sol \
+  --deep openai-codex/gpt-6-astra
 ```
 
 ## How it works
 
 | Component | File | Purpose |
 |---|---|---|
-| Template | `sbx-kit/Dockerfile` | Extends `docker/sandbox-templates:shell-nightly` with omp binary + dev tools |
-| Kit | `sbx-kit/spec.yaml` | Defines omp entrypoint, network allow-list, env, agent context |
+| Interactive template | `sbx-kit/Dockerfile` | Extends `shell-docker-nightly` with the nested Docker Engine, OMP binary, browser, and development tools |
+| Interactive kit | `sbx-kit/spec.yaml` | Defines the OMP entrypoint, network allow-list, environment, and agent context |
+| Configure template | `sbx-configure-kit/Dockerfile` | Extends the lightweight non-Docker `shell` template with only the OMP binary |
+| Configure kit | `sbx-configure-kit/spec.yaml` | Defines the parked entrypoint and provider-only network policy used by `omp --configure` |
+| Configure builder | `build-configure.sh` | Builds, tags, and loads only the local configure template |
 | Env (experimental) | `sbx-kit/.sbxenv.yaml` + `omp-sbxenv` | Declarative alternative launcher for scripted/CI use — see [Scripted / CI use](#scripted--ci-use-experimental) |
 | Launcher | `omp-sbx` | Wrapper handling banner, sandbox lifecycle, resume vs new |
+| Model configuration | `omp-sbx-configure-models` | Discovers available models and updates global OMP role and bundled-agent routing |
 | Parallel | `omp-sbx-parallel` | Git worktree-based parallel sandbox launcher |
 | MCP import | `omp-sbx-mcp-import` | Registers Claude Code's MCP servers with sbx - see [MCP servers](#mcp-servers-from-claude-code) |
 | MCP gateway | `sbx-kit/omp-init.sh` | Opt-in wiring that connects omp to the sandbox's MCP gateway |
-| Browser CLI | `sbx-kit/Dockerfile` | Installs `agent-browser` (replaces Puppeteer, which can't spawn in sbx) |
+| Browser | `sbx-kit/Dockerfile` | Installs architecture-native Chromium for OMP's built-in browser API |
 | Bedrock auth | `sbx-kit/omp-init.sh` | Opt-in AWS SSO profile with browserless renewal - see [Amazon Bedrock](#amazon-bedrock-aws-sso) |
 | Bedrock login | `omp-sbx-aws-login` | Host-side SSO login, shared with every sandbox via `~/.omp/aws-sso-cache` |
 | SSO nudge | `sbx-kit/extensions/aws-sso-nudge.ts` | omp extension: warns before the SSO login lapses, adds `/aws-login` |
 
 ### Config sharing
 
-sbx mounts additional workspaces at their **host path** inside the container (e.g. `/Users/<user>/.omp`). The kit's startup command symlinks this to `/home/agent/.omp` so omp's `PI_CONFIG_DIR=.omp` resolves correctly.
+sbx mounts additional workspaces at their **host path** inside the microVM (e.g. `/Users/<user>/.omp`). The kit's startup command symlinks this to `/home/agent/.omp` so omp's `PI_CONFIG_DIR=.omp` resolves correctly.
+
+### Model defaults
+
+`omp --configure` creates a fresh disposable sandbox from the lightweight
+configure image, which has OMP but no nested Docker daemon, browser, language
+servers, or development toolchain. It discovers the model catalog visible with
+the current host-wide sbx provider credentials and shared OMP authentication,
+then opens an Up/Down menu for each missing fast, standard, or deep tier. Each
+model selection is followed by a thinking-level menu.
+The configure image uses a small argument-tolerant entrypoint that ignores
+sandbox-injected agent or MCP arguments and parks instead of launching an
+interactive OMP session. The helper uses noninteractive `sbx exec` commands,
+removes the sandbox on every exit path, and then returns control to the host.
+If the local `omp-sbx-configure:latest` template is missing or exits immediately
+because it is stale, the helper invokes `build-configure.sh` once. The saved
+Docker image carries that exact tag, so the one-argument `sbx template load`
+supported by the installed CLI restores the local name before creation is
+retried. Custom `OMP_SBX_CONFIGURE_TEMPLATE` values are never built implicitly.
+
+Thinking choices start with **Inherit** (no role-specific override), then **Off**
+(a native disable request), followed by that model's advertised concrete efforts:
+`minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Unsupported efforts are not
+offered. Models without configurable efforts still offer Inherit and Off;
+Off does not guarantee that a provider disables mandatory reasoning.
+The initial thinking selection is always Inherit.
+
+By default, the selected tiers update these global mappings:
+
+| Tier | Roles | Bundled agents |
+|---|---|---|
+| Fast | `smol` | `scout`, `sonic` |
+| Standard | `default`, `plan` | `task` via `@task` → `@default`, unless a task role is already saved |
+| Deep | `slow`, `advisor` | `reviewer`, `security-reviewer` |
+
+Interactive configuration then asks `Do you want to configure the optional models?`.
+Answer Yes to select overrides for `plan`, `vision`, `designer`, `commit`, `tiny`,
+`task`, and `advisor`, in that order. These menus use the same navigation and
+cancellation keys; press `s` to skip a role. Vision requires an image-capable
+model and is optional when the main model handles images.
+Skipping `plan` or `advisor` retains the standard or deep tier assignment,
+including its thinking level. Skipping `task` preserves its exact saved role
+(including any thinking suffix or alias), or assigns `@default` if none exists.
+Skipping any other optional role preserves its saved mapping, or leaves it
+unassigned. Skipped roles do not open a thinking menu. Explicitly selecting a
+role replaces its whole model/thinking assignment; choosing Inherit clears that
+assignment's previous thinking suffix. Menu cursor defaults are suggestions,
+not assignments.
+
+The bundled task agent always routes through `@task`, so a project's task role
+can override the global fallback. Selecting `designer` routes its agent through
+`@designer`, replacing any saved override for that agent; skipping it preserves
+the saved agent choice. Intentional agent-specific model overrides can take
+precedence over roles. Projects can override those choices with native
+`task.agentModelOverrides` settings.
+
+Non-interactive invocations skip the optional question. The resolved and success
+summaries show intended role and agent assignments, global scope, and the
+`modelRoleStorage: project` preference. Unrelated saved mappings remain unchanged.
+Dry-run reads the current global configuration to preserve saved choices, but
+does not write configuration.
+
+Use `omp --configure --dry-run` to discover and validate selections without
+writing configuration. For non-interactive use, supply all three selectors:
+
+```bash
+omp --configure \
+  --fast openai-codex/gpt-5.6-luna \
+  --standard openai-codex/gpt-5.6-sol \
+  --deep openai-codex/gpt-6-astra
+```
+
+Append `:LEVEL` to any CLI selector to set its role-specific thinking, for example
+`--deep provider/model:high`, using a model from the discovered catalog that
+supports `high`. `:inherit` normalizes to the bare selector; `:off` is distinct.
+CLI-supplied tiers never open model or thinking menus, even on a terminal.
+Unknown or unsupported levels fail before configuration writes. Exact catalog
+identities take precedence over suffix parsing, including IDs containing colons;
+the interactive menu rejects a thinking assignment that would collide with
+another exact model ID.
+
+Thinking is stored in native `modelRoles` selector strings, not a separate map.
+A bare selector uses native inheritance. Project role overrides replace the
+complete global selector, including its thinking suffix. The helper requires
+catalog `reasoning` and `thinking` metadata and fails on incompatible output
+rather than guessing capabilities from model names.
+
+The helper preserves unrelated mappings in `modelRoles` and
+`task.agentModelOverrides`, then publishes them to the native host configuration,
+normally the physical target of
+`~/.omp/agent/config.yml`. The helper resolves the guest `~/.omp` mount and
+OMP's active directory separately, requires the active directory to stay within
+that guest mount, then maps its relative path onto the physical host `~/.omp`.
+This handles sbx exposing the host mount at a guest-only path such as
+`/home/agent/.omp`. The resolved host file is printed in the dry-run summary and
+after a successful write. `/var/tmp/omp-configure-models-*` is only a
+project-free guest working directory, so project overrides are never copied
+into global defaults.
+“Global” means shared across this user's `omp-sbx` sandboxes, not all OS users.
+
+A successful configuration also sets global `modelRoleStorage: project`, enabling
+global/project save choices in `/model` → Roles. To override a role for one
+project, open Roles in that project's session and save the assignment to Project.
+Native `.omp/config.yml` role keys override matching global roles; other roles
+continue to inherit global defaults. The helper never changes project files.
+The storage preference controls hub save choices, not the helper's write scope.
+
+The helper copies the current native host file into a private mounted staging
+directory, lets OMP serialize and verify all three settings there, and only then
+atomically replaces the host `config.yml`. A failed update or readback leaves the
+host file untouched; semantic rollback is confined to the disposable staging
+copy.
+An OMP process reads these settings at startup. Exit and relaunch it after
+configuration; if the launcher reattaches to the already-running process, use
+`omp --new` to restart the sandbox process while retaining shared session data.
+
+The helper does not need a separate PATH symlink. Catalog visibility confirms
+that OMP can discover a selector, but actual provider requests remain subject
+to the network policy in `sbx-kit/spec.yaml`. The native Roles hub remains the
+advanced surface for adaptive thinking (`auto`), aliases, ordered selectors, and
+clearing assignments. The helper does not change `defaultThinkingLevel`.
+Ordered selectors select an available model; they are not request retry fallback
+chains.
+
+### Docker inside the sandbox
+
+The template extends Docker's `shell-docker-nightly` sbx base. That starts a private Docker Engine inside the sbx microVM and exposes the normal socket at `/var/run/docker.sock`. The socket is **not** the host Docker socket: containers, images, volumes, and `docker ps` output belong to the sandbox and are removed with the sandbox.
+
+Projects may propose an external-image allowlist in
+`.omp-sbx-docker-images.yaml`:
+
+```yaml
+schemaVersion: 1
+allowedImages:
+  - docker.io/library/alpine:3.22
+  - ghcr.io/example/tool@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+```
+
+The file is optional. Without it, the sandbox denies every external image pull.
+On first launch, the host launcher copies the project file—or a generated empty
+allowlist—into host state outside the writable project. Only that snapshot
+directory is mounted read-only and consumed by `omp-sbx-image-policy`; the
+plugin never reads the project copy. Short Docker Hub names are normalized
+(`alpine` becomes `docker.io/library/alpine:latest`), and malformed policies
+stop startup. Tags are mutable; use a digest when image content must be fixed.
+
+The policy applies to Docker pulls, container creation, tags, and supported
+builds. Locally built images remain usable when tagged with an unqualified name
+such as `my-app:dev` or under `local/`. `docker build` and
+`docker buildx build|bake` automatically receive the generated Buildx policy.
+Compose pulls and `up` without `--build` work normally; use
+`docker buildx bake -f compose.yaml` instead of `docker compose build` or
+`docker compose up --build`.
+
+Project edits do not change an approved snapshot, including after a normal
+reattach, restart, or `--new`. Apply a host-reviewed change explicitly:
+
+```bash
+omp-sbx --refresh-image-policy
+omp-sbx-parallel --branch feature-x --refresh-image-policy
+omp-sbxenv --refresh-image-policy
+```
+
+The refresh recreates the affected sandbox/environment so the new snapshot is
+compiled and activated. Deleting the project YAML and refreshing switches the
+policy to deny-all. Sandboxes created before snapshot mounting was added also
+default to deny-all until refreshed once.
+
+This is a guardrail, not a hard security boundary. Passwordless `sudo` can
+remove the plugin or reconfigure the daemon. Docker AuthZ also does not cover
+native/upgraded gRPC, and non-JSON build contexts are enforced by the CLI
+wrapper plus Buildx policy rather than inspected by AuthZ.
+
+`./build.sh` verifies this contract by creating a throwaway sandbox and running:
+
+```bash
+test -S /var/run/docker.sock
+docker version
+docker ps
+```
 
 ### GitHub auth forwarding
 
@@ -106,8 +298,8 @@ reports what already exists and changes nothing.
 
 **Why not just mount the Claude config.** Registering is a host-side act, and
 that is the point. A local stdio server runs on the host, and a remote server's
-OAuth flow opens a host browser - so the credential never enters the sandbox,
-which has no keychain and no browser to offer.
+OAuth flow opens the user's host browser, so the credential never enters the
+sandbox or depends on a host keychain/browser session there.
 
 **Two ways to reach a sandbox, and they do not mix:**
 
@@ -184,8 +376,8 @@ omp-sbx-aws-login
 ```
 
 from a project with `OMP_SBX_AWS_PROFILE` set (or `omp-sbx-aws-login --profile
-<name>` anywhere). It opens a real browser - the host has one, unlike a
-sandbox - and writes the resulting SSO token into `~/.omp/aws-sso-cache`, which
+<name>` anywhere). It opens the user's interactive browser on the host and
+writes the resulting SSO token into `~/.omp/aws-sso-cache`, which
 every sandbox symlinks `~/.aws/sso/cache` to. A brand new sandbox, or one
 recreated with `--new`, picks up an already-valid session immediately; nothing
 about the token needs redoing per sandbox.
@@ -197,9 +389,10 @@ identity, shared across this host's own sandboxes.
 
 A sandbox can still log in on its own if you'd rather not leave it: run
 `/aws-login` once the session starts, which the nudge extension below handles
-with a device-code flow (no browser inside the sandbox, so `--use-device-code`
-is required there - the alternative PKCE flow's `redirect_uri` is a loopback
-port nothing listens on). That login is shared too, through the same symlink.
+with a device-code flow. The sandbox's headless Chromium cannot complete an
+interactive user login, and the alternative PKCE flow redirects to a loopback
+port that the host browser cannot reach. That login is shared too, through the
+same symlink.
 
 **Renewal is browserless.** `omp-init.sh` generates an `omp-bedrock` profile
 whose `credential_process` calls `aws configure export-credentials`. omp reads
@@ -254,54 +447,85 @@ Adding a region means adding its `bedrock-runtime`, `oidc`, `portal.sso`, and
 
 ### LSP servers
 
-The template ships with language servers for Python (`pyright`), TypeScript/JavaScript (`typescript-language-server`), Bash (`bash-language-server`), and Go (`gopls`).
+The image ships 51 of the 55 enabled language-server commands in OMP
+`v18.1.21`. The two Nix servers (`nil` and `nixd`), `ocamllsp`, and
+`tlapm_lsp` are intentionally omitted. The Nix package manager, profiles, and
+runtime are not installed. The Docker build fails if this 51-installed/4-omitted
+contract changes or any required command is missing.
 
-**Two-part setup, split by concern:**
+**Installation is split by distribution mechanism:**
 
-| Part | Location | Rebuild needed? |
+| Part | Location | Details |
 |---|---|---|
-| Binary install | `sbx-kit/Dockerfile` (the `LSP servers` section) | Yes — `./build.sh` |
-| Server registration | `~/.omp/lsp.yml` on the host | No — live via `~/.omp` bind mount |
+| Package-manager servers | `sbx-kit/Dockerfile` | Pinned npm, Go, uv, Ruby, Kotlin, Erlang, and Swift installs |
+| Native/toolchain servers | `sbx-kit/install-native-lsps.sh` | Architecture-specific, pinned, checksum-verified releases and source builds |
+| User registration overrides | `~/.omp/lsp.yml` on the host | Live through the `~/.omp` bind mount; no image rebuild needed |
 
-`lsp.yml` is bind-mounted into the sandbox, so editing it takes effect immediately on the next session. Adding or changing a *binary* requires a rebuild + `omp --new`.
+Downloaded tool artifacts live under `/home/agent/.local/share/<tool>`.
+Stable command entry points live in `/home/agent/.local/bin`; NVM-managed
+Node 20/22/24/26, Cargo, GHCup, Swift, Go, Bun, Ruby, and pnpm paths remain
+available for their native toolchains. Node 24 is the default runtime. The
+installer supports Linux `x86_64`/`amd64` and `aarch64`/`arm64` and rejects
+other architectures.
 
-#### Lazy loading
+#### Lazy loading and overrides
 
-omp starts LSP servers **lazily**, keyed on `fileTypes` matching actual files in the open workspace. A server only activates for workspaces that contain a file whose extension matches one of its `fileTypes`. The message *“No language servers configured for this project”* (from `lsp status`) means **no file in the workspace matched** any server's `fileTypes` — not that the config is missing.
+omp starts LSP servers **lazily**, keyed on `fileTypes` matching actual files
+in the open workspace. A server activates only when a workspace contains a
+matching file. The message *“No language servers configured for this project”*
+from `lsp status` means no workspace file matched; it does not mean the
+configuration is missing.
 
-`rootMarkers` (`.git`, `go.mod`, `package.json`) set the project root but do **not** start a server by themselves; a matching file type is also required.
+`rootMarkers` such as `.git`, `go.mod`, and `package.json` select the project
+root but do not start a server without a matching file type. Entries in the
+host's `~/.omp/lsp.yml` can replace or extend OMP's defaults for the next
+session.
 
-#### Adding a server
+#### Adding or changing a server
 
-1. Install the binary in `sbx-kit/Dockerfile` — append to the global `npm install` line for npm packages, or add a separate `RUN` step for non-npm servers (`go install`, `cargo install`, etc.).
-2. Register the server in `~/.omp/lsp.yml`:
-   ```yaml
-     gopls:
-       command: gopls
-       args: ["serve"]
-       fileTypes: [".go"]
-       rootMarkers:
-         - "go.mod"
-         - ".git"
-   ```
-3. Rebuild + load (`./build.sh`), then start a fresh sandbox (`omp --new`).
+1. Pin and install its command in `sbx-kit/Dockerfile` or
+   `sbx-kit/install-native-lsps.sh`. Verify upstream checksums or signatures
+   when published; otherwise pin a reviewed checksum or source commit.
+2. If OMP does not register it by default, add its command, arguments, file
+   types, and root markers to `~/.omp/lsp.yml`.
+3. Rebuild and load the image with `./build.sh`, then start a fresh sandbox
+   with `omp --new`. Registration-only changes need only a fresh session.
 
-### Browser automation (agent-browser)
+### Browser automation
 
-The omp `browser` tool (Puppeteer/Chromium) **cannot spawn inside the sbx microVM** — the bundled `chrome-linux64` binary fails with `ENOEXEC`. The template instead ships [`agent-browser`](https://github.com/vercel-labs/agent-browser), a native Rust CLI, paired with a real Chromium installed via **Playwright** (which provides Linux ARM64 builds, unlike Chrome for Testing or Ubuntu's `chromium-browser` snap stub).
+OMP's Eval `browser` API is enabled by default. The template installs
+Playwright's architecture-native Chromium and sets
+`PUPPETEER_EXECUTABLE_PATH=/usr/local/bin/chromium`, preventing OMP from
+downloading a Chrome-for-Testing binary that may be incompatible with the sbx
+microVM architecture.
 
-```bash
-agent-browser open https://example.com      # launch + navigate
-agent-browser snapshot                       # accessibility tree with @eN refs
-agent-browser click @e2                      # click by ref
-agent-browser fill @e3 "text"                # fill input
-agent-browser screenshot page.png            # capture
-agent-browser close
+Use the browser from an Eval JavaScript cell:
+
+```javascript
+const tab = await browser.open({ name: "docs", url: "https://example.com" });
+const observed = await tab.observe();
+const title = await tab.title();
+await tab.close();
 ```
 
-The sbx TLS proxy intercepts HTTPS, so `AGENT_BROWSER_IGNORE_HTTPS_ERRORS=true` is set in `spec.yaml` to avoid cert errors. For **static content** (articles, docs, GitHub issues/PRs, JSON, PDFs) no browser is needed — the omp `read` tool fetches clean text/markdown from a URL directly. Reach for `agent-browser` only when JS execution or interaction is required.
+The API also supports `click`, `fill`, `press`, `screenshot`, and custom
+Puppeteer work through `tab.run`. Use the `read` tool instead for static URLs
+that do not require JavaScript or interaction.
 
-Changing the `agent-browser` or Playwright Chromium version requires a rebuild (`./build.sh`) + `omp --new`.
+The image pins Chromium through `playwright@1.63.0`. Playwright-driven project
+tests must use the same Playwright release because each release requires its
+matching browser revision:
+
+```bash
+pnpm add --save-dev --save-exact playwright@1.63.0
+```
+
+The sbx TLS proxy injects its CA into the container trust store, so Chromium
+keeps certificate validation enabled. Do not set
+`PUPPETEER_PROXY_IGNORE_CERT_ERRORS`.
+
+Changing the Playwright Chromium version requires a rebuild (`./build.sh`) and
+a fresh sandbox (`omp --new`).
 
 ### Security
 
@@ -312,6 +536,7 @@ All security is handled by the sbx microVM — no manual `cap_drop`, `gosu`, `um
 | Isolation | MicroVM with separate kernel |
 | Non-root user | Built-in `agent` UID 1000 |
 | Network | Policy-based allow-list |
+| Docker images | Project allowlist enforced by daemon AuthZ and Buildx policy |
 | Secrets | Proxy injects keys (never enter sandbox) |
 | Resource limits | `sbx run --memory --cpus` |
 

@@ -5,6 +5,7 @@
 #   omp-sbx-parallel                    pick or create a branch
 #   omp-sbx-parallel --branch fix-bug   use an existing branch
 #   omp-sbx-parallel --new feature-x    create the branch
+#   omp-sbx-parallel --branch fix-bug --refresh-image-policy
 #
 # The worktree is a sibling of the repo root, so branch fix-bug of
 # ~/src/myproject lands at ~/src/myproject@fix-bug. Each session gets its own
@@ -36,12 +37,14 @@ log() { printf '%s\n' "$*" >&2; }
 # ── Parse flags ──────────────────────────────────────────────────────────────
 BRANCH=""
 CREATE_NEW=""
+REFRESH_IMAGE_POLICY=false
 SKIP_PAUSE=false
 OMP_ARGS=()
 for arg in "$@"; do
   case "$arg" in
     --branch) CREATE_NEW="existing" ;;
     --new)    CREATE_NEW="new" ;;
+    --refresh-image-policy) REFRESH_IMAGE_POLICY=true ;;
     --yes|-y) SKIP_PAUSE=true ;;
     --help|-h)
       sed -n '2,/^###/p' "$0" | sed 's/^# \?//' >&2
@@ -258,6 +261,10 @@ add_worktree_to_workspace "$BRANCH" "$WORKTREE_PATH"
 # ── Sandbox name (unique per worktree) ───────────────────────────────────────
 # The branch is part of the name, so two worktrees of one repo do not collide.
 SANDBOX_NAME="$(sandbox_name_for "${REPO_BASE}-${BRANCH}")"
+if $REFRESH_IMAGE_POLICY; then
+  sbx rm -f "$SANDBOX_NAME" >/dev/null 2>&1 || true
+fi
+prepare_docker_image_policy "$WORKTREE_PATH" "$SANDBOX_NAME" "$REFRESH_IMAGE_POLICY"
 
 # ── Banner ───────────────────────────────────────────────────────────────────
 log ""
@@ -266,6 +273,7 @@ log "${C_CYAN}│${C_RST} template  : ${TEMPLATE}"
 log "${C_CYAN}│${C_RST} repo      : ${REPO_ROOT}"
 log "${C_CYAN}│${C_RST} branch    : ${BRANCH}  ${C_DIM}(from ${CURRENT_BRANCH})${C_RST}"
 log "${C_CYAN}│${C_RST} worktree  : ${WORKTREE_PATH}  ${C_DIM}→ /home/agent/workspace${C_RST}"
+log "${C_CYAN}│${C_RST} images    : ${DOCKER_IMAGE_POLICY_ORIGIN}  ${C_DIM}(snapshot: ${DOCKER_IMAGE_POLICY_DIR})${C_RST}"
 log "${C_CYAN}│${C_RST} config    : ${HOME}/.omp  ${C_DIM}(shared, via symlink)${C_RST}"
 log "${C_CYAN}│${C_RST} sandbox   : ${SANDBOX_NAME}"
 if [ "$#" -eq 0 ]; then
@@ -345,9 +353,12 @@ sandbox_exists() {
   sbx ls 2>/dev/null | awk -v name="$1" 'NR>1 && $1 == name {found=1} END {exit !found}'
 }
 
-# Cleanup removes the sandbox on every exit path, so one survives only a
-# force-quit. Drop it here when its kit has moved since.
-drop_stale_sandbox "$SANDBOX_NAME" "$KIT_DIR" || true
+# Cleanup removes the sandbox on every normal exit, so one survives only a
+# force-quit. A refresh removed it before snapshotting; otherwise a stale kit
+# still forces replacement.
+if ! $REFRESH_IMAGE_POLICY; then
+  drop_stale_sandbox "$SANDBOX_NAME" "$KIT_DIR" || true
+fi
 
 # Interactive mode creates and attaches in separate steps, with a pause in
 # between, because attaching hands the screen to omp and any sbx warning from
@@ -362,7 +373,7 @@ if [ "$#" -eq 0 ] && [ -t 0 ]; then
     # sandbox does exist (a force-quit left it stopped) and attaching will
     # find it. Any other failure is real.
     if create_out="$(sbx create --template "$TEMPLATE" --name "$SANDBOX_NAME" \
-        "$KIT_DIR" "$WORKTREE_PATH" "$HOME/.omp" "${REPO_ROOT}/.git" 2>&1)"; then
+        "$KIT_DIR" "$WORKTREE_PATH" "$HOME/.omp" "${REPO_ROOT}/.git" "$DOCKER_IMAGE_POLICY_DIR:ro" 2>&1)"; then
       if [ -n "$create_out" ]; then printf '%s\n' "$create_out" >&2; fi
       sleep 2
     else
@@ -393,7 +404,7 @@ if [ "$#" -eq 0 ] && [ -t 0 ]; then
       log "${C_DIM}omp-sbx-parallel: sandbox unresponsive, recreating...${C_RST}"
       sbx rm -f "$SANDBOX_NAME" >/dev/null 2>&1 || true
       if ! sbx create --template "$TEMPLATE" --name "$SANDBOX_NAME" \
-          "$KIT_DIR" "$WORKTREE_PATH" "$HOME/.omp" "${REPO_ROOT}/.git" 2>&1; then
+          "$KIT_DIR" "$WORKTREE_PATH" "$HOME/.omp" "${REPO_ROOT}/.git" "$DOCKER_IMAGE_POLICY_DIR:ro" 2>&1; then
         log "${C_RED}omp-sbx-parallel: failed to create sandbox${C_RST}"
         exit 1
       fi
@@ -407,7 +418,7 @@ else
     # the name, and sbx exec starts a stopped sandbox anyway. Real errors show
     # up there.
     if ! sbx create --template "$TEMPLATE" --name "$SANDBOX_NAME" \
-        "$KIT_DIR" "$WORKTREE_PATH" "$HOME/.omp" "${REPO_ROOT}/.git" >/dev/null 2>&1; then
+        "$KIT_DIR" "$WORKTREE_PATH" "$HOME/.omp" "${REPO_ROOT}/.git" "$DOCKER_IMAGE_POLICY_DIR:ro" >/dev/null 2>&1; then
       :
     else
       sleep 2

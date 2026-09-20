@@ -10,5 +10,8 @@ additionalWorkspaces:
   # Host ~/.omp keeps sessions, skills and memories across restarts. It has
   # to exist: `sbx env create` prompts for a missing path, so CI hangs.
   - path: ${HOME}/.omp
+  # Per-project Docker image allowlist, mounted separately from the rw workspace.
+  - path: ${OMP_SBXENV_DOCKER_POLICY}
+    readOnly: true
 sandboxOptions:
   template: omp-sbx:latest

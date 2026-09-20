@@ -5,6 +5,7 @@
 #
 #   omp-sbxenv                 create if needed, then attach
 #   omp-sbxenv --new           remove and recreate
+#   omp-sbxenv --refresh-image-policy  approve policy changes and recreate
 #   omp-sbxenv --version       passthrough omp flags
 #   omp-sbxenv "fix the bug"   one-shot prompt
 #
@@ -55,19 +56,29 @@ esac
 
 # ── Parse flags ──────────────────────────────────────────────────────────────
 FORCE_NEW=false
+REFRESH_IMAGE_POLICY=false
 OMP_ARGS=()
 for arg in "$@"; do
   case "$arg" in
     --new) FORCE_NEW=true ;;
-    *)     OMP_ARGS+=("$arg") ;;
+    --refresh-image-policy) REFRESH_IMAGE_POLICY=true ;;
+    *) OMP_ARGS+=("$arg") ;;
   esac
 done
 if [ ${#OMP_ARGS[@]} -gt 0 ]; then set -- "${OMP_ARGS[@]}"; else set --; fi
 
-if $FORCE_NEW; then
-  log "${C_DIM}omp-sbxenv: removing existing environment '$OMP_SBXENV_NAME' (--new)${C_RST}"
+
+if $FORCE_NEW || $REFRESH_IMAGE_POLICY; then
+  if $REFRESH_IMAGE_POLICY; then
+    log "${C_DIM}omp-sbxenv: recreating environment '$OMP_SBXENV_NAME' with refreshed Docker image policy${C_RST}"
+  else
+    log "${C_DIM}omp-sbxenv: removing existing environment '$OMP_SBXENV_NAME' (--new)${C_RST}"
+  fi
   sbx env rm "$KIT_DIR" --force >/dev/null 2>&1 || true
+
 fi
+prepare_docker_image_policy "$OMP_SBXENV_WORKSPACE" "$OMP_SBXENV_NAME" "$REFRESH_IMAGE_POLICY"
+export OMP_SBXENV_DOCKER_POLICY="$DOCKER_IMAGE_POLICY_DIR"
 
 # ── Launch ───────────────────────────────────────────────────────────────────
 if [ "$#" -eq 0 ] && [ -t 0 ]; then
@@ -77,5 +88,5 @@ else
   # Ignore a failed create: it means the environment already exists, and
   # `sbx env exec` starts it either way.
   sbx env create "$KIT_DIR" >/dev/null 2>&1 || true
-  exec sbx env exec "$KIT_DIR" -- omp "$@"
+  exec sbx env exec "$KIT_DIR" -- omp-init.sh "$@"
 fi
