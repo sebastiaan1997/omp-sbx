@@ -124,6 +124,7 @@ sandbox_name_for() {
   esac
 }
 
+
 # Prepares the Docker image policy that the guest may trust. The project file is
 # only a proposed source: the authoritative snapshot lives outside the writable
 # workspace and changes solely through an explicit refresh.

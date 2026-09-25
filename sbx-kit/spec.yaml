@@ -8,15 +8,76 @@ sandbox:
   image: "omp-sbx:latest"
   entrypoint: [omp-init.sh]
 
+credentials:
+  - service: anthropic
+    apiKey:
+      name: ANTHROPIC_API_KEY
+      proxyManaged: true
+      inject:
+        - domain: api.anthropic.com
+          header: x-api-key
+          format: "%s"
+  - service: openai
+    oauth:
+      tokenEndpoint:
+        host: auth.openai.com
+        path: /oauth/token
+      sentinels:
+        accessToken: oai-oat01-proxy-managed
+        refreshToken: oai-ort01-proxy-managed
+      resourceHosts:
+        - chatgpt.com
+        - api.openai.com
+  - service: google
+    apiKey:
+      name: GEMINI_API_KEY
+      proxyManaged: true
+      inject:
+        - domain: generativelanguage.googleapis.com
+          header: x-goog-api-key
+          format: "%s"
+  - service: groq
+    apiKey:
+      name: GROQ_API_KEY
+      proxyManaged: true
+      inject:
+        - domain: api.groq.com
+          header: Authorization
+          format: "Bearer %s"
+  - service: mistral
+    apiKey:
+      name: MISTRAL_API_KEY
+      proxyManaged: true
+      inject:
+        - domain: api.mistral.ai
+          header: Authorization
+          format: "Bearer %s"
+  - service: openrouter
+    apiKey:
+      name: OPENROUTER_API_KEY
+      proxyManaged: true
+      inject:
+        - domain: openrouter.ai
+          header: Authorization
+          format: "Bearer %s"
+  - service: xai
+    apiKey:
+      name: XAI_API_KEY
+      proxyManaged: true
+      inject:
+        - domain: api.x.ai
+          header: Authorization
+          format: "Bearer %s"
 agentInstructions:
   filename: AGENTS.md
   content: |
     ## Sandbox environment
 
     You are running inside a Docker sbx sandbox (microVM). The workspace is
-    mounted at `/home/agent/workspace`. Your configs (`~/.omp`) are bind-mounted
-    from the host — agent.db, managed-skills, memories, and sessions persist
-    across sandbox restarts.
+    mounted at `/home/agent/workspace`; OMP state is mounted at
+    `/home/agent/.omp`. The host launcher assigns a different persistent state
+    directory to each sandbox, so logins, settings, sessions, memories, and
+    SQLite files survive recreation without cross-VM writers.
 
     Docker is available inside the sandbox through the sandbox-local daemon at
     `/var/run/docker.sock`. Do not mount or use the host Docker socket; `docker ps`
@@ -44,17 +105,6 @@ agentInstructions:
 
     `sudo` is passwordless; use it for system package installs.
 
-    Amazon Bedrock models are available only when the project `.env` sets
-    `OMP_SBX_AWS_PROFILE`. Credentials resolve through `credential_process`, so
-    the AWS CLI renews the short-lived access token on its own. Renewal stops
-    working once the SSO client registration lapses, which takes weeks. If an AWS
-    call reports an expired or missing token, run
-    `aws sso login --no-browser --use-device-code --profile "$OMP_SBX_AWS_PROFILE"`
-    and give the printed URL and code to the user to open. The sandbox's
-    headless browser cannot complete an interactive SSO login on the user's
-    behalf. Keep `--use-device-code`: without it the CLI prints a URL that
-    redirects to a port inside this sandbox, which the user's browser cannot
-    reach.
 
     OMP's Eval `browser` API is enabled and uses the Chromium installed at
     `/usr/local/bin/chromium`. Open it with `await browser.open(...)`; use
@@ -68,24 +118,20 @@ agentInstructions:
 permissions:
   network:
     allow:
-      # Model providers - add the ones you use
-      # - "api.anthropic.com:443"
+      # Model provider APIs
+      - "api.anthropic.com:443"
       - "api.openai.com:443"
       - "auth.openai.com:443"
       - "chatgpt.com:443"
-      # - "openrouter.ai:443"
-      # - "*.openrouter.ai:443"
-      # - "opencode.ai:443"
-
+      - "generativelanguage.googleapis.com:443"
+      - "api.groq.com:443"
+      - "api.mistral.ai:443"
+      - "openrouter.ai:443"
+      - "api.x.ai:443"
       - "*.opencode.ai:443"
       # Amazon Bedrock, us-east-1. Add the hosts for another region to use it.
       - "bedrock-runtime.us-east-1.amazonaws.com:443"
       - "bedrock.us-east-1.amazonaws.com:443"
-      # AWS SSO: oidc serves the device-code login, portal.sso hands out role
-      # credentials, sts answers get-caller-identity.
-      - "oidc.us-east-1.amazonaws.com:443"
-      - "portal.sso.us-east-1.amazonaws.com:443"
-      - "sts.us-east-1.amazonaws.com:443"
       # omp release metadata, downloads and self-update
       - "api.github.com:443"
       - "github.com:443"
@@ -95,6 +141,8 @@ permissions:
       - "registry.npmjs.org:443"
       - "pypi.org:443"
       - "files.pythonhosted.org:443"
+      - "index.crates.io:443"
+      - "static.crates.io:443"
       # Local model servers on the host
       - "host.docker.internal:*"
       # Docs and context providers
@@ -108,15 +156,15 @@ permissions:
 # ── Environment ──────────────────────────────────────────────────────────────
 environment:
   variables:
-    # .omp resolves to ~/.omp, the symlink to the host config mount.
+    # .omp resolves to the per-sandbox persistent state symlink.
     PI_CONFIG_DIR: ".omp"
     HOME: "/home/agent"
+    # OMP's openai-codex provider sends this sentinel to chatgpt.com; sbx swaps
+    # the real OAuth access token into the outbound request.
+    OPENAI_CODEX_OAUTH_TOKEN: "oai-oat01-proxy-managed"
     GH_CONFIG_DIR: "/home/agent/.config/gh"
     # Force OMP/Puppeteer to use the architecture-native Chromium in the image.
     PUPPETEER_EXECUTABLE_PATH: "/usr/local/bin/chromium"
-    # botocore ships its own CA bundle and ignores the OS trust store, so every
-    # AWS call fails against the sbx TLS proxy until it is pointed back at it.
-    AWS_CA_BUNDLE: "/etc/ssl/certs/ca-certificates.crt"
 
 setup:
   startup:

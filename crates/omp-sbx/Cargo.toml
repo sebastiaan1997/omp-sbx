@@ -1,0 +1,41 @@
+[package]
+name = "omp-sbx"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "omp-sbx"
+path = "src/main.rs"
+
+[features]
+default = []
+real-sbx = []
+
+[dependencies]
+anyhow.workspace = true
+atomic-write-file.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+directories.workspace = true
+fs4.workspace = true
+hex.workspace = true
+include_dir.workspace = true
+libc.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[test]]
+name = "real_sbx_parity"
+path = "tests/real_sbx_parity.rs"
+required-features = ["real-sbx"]

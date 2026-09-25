@@ -4,16 +4,16 @@
 
 # omp-sbx Oh My Pi Sandbox
 
-Run the [omp coding agent](https://omp.sh) (oh-my-pi) inside a [Docker sbx](https://docs.docker.com/ai/sandboxes/) sandbox with host configs shared.
+Run the [omp coding agent](https://omp.sh) (oh-my-pi) inside a [Docker sbx](https://docs.docker.com/ai/sandboxes/) sandbox with persistent per-sandbox state.
 
 ## What it does
 
 - Launches omp inside a Docker sbx microVM — sbx handles all security (non-root user, network policies, secret proxy, resource limits)
 - Provides a private Docker Engine inside the sbx microVM, so `/var/run/docker.sock`, `docker ps`, `docker build`, and Docker Compose target sandbox-local containers/images instead of the host daemon
-- Bind-mounts your `~/.omp` (agent.db, managed-skills, memories, sessions) so state persists across sandbox restarts
-- Sandboxes are per-directory: running from the same cwd reconnects to the same sandbox
-- Recovers automatically after a force-quit: if the sandbox is left stopped (or its agent wedged), the launcher re-attaches, then stops+restarts, and as a last resort recreates the sandbox — your omp session resumes from the shared `~/.omp` either way
-- `--new` flag forces a fresh sandbox
+- Mounts a distinct host-backed `~/.omp` tree for every sandbox, so SQLite databases have only one microVM writer while settings, logins, memories, and sessions survive recreation
+- Sandboxes are per-directory: running from the same cwd reconnects to the same sandbox and state tree
+- Recovers automatically after a force-quit: if the sandbox is left stopped (or its agent wedged), the launcher re-attaches, then stops+restarts, and as a last resort recreates the sandbox without deleting its OMP state
+- `--new` forces a fresh sandbox while retaining that sandbox's OMP state
 
 ## Prerequisites
 
@@ -23,20 +23,19 @@ sbx login
 sbx policy set-default balanced
 ```
 
+Docker `sbx` 0.43.0 or newer is required.
+
 ## Install
 
 ```bash
 git clone https://github.com/mikeatlas/omp-sbx.git ~/src/github.com/mikeatlas/omp-sbx
 cd ~/src/github.com/mikeatlas/omp-sbx
 
-# Build + load the interactive and configure-only template images into sbx
-./build.sh
+# Build and install the fully native Rust launcher as `omp-sbx`.
+./install-rust.sh
 
-# Rebuild only the minimal configure template when needed
-./build-configure.sh
-
-# Symlink the launcher onto your PATH
-ln -sf "$PWD/omp-sbx" ~/.local/bin/omp-sbx
+# Build and load both templates with the Rust launcher.
+omp-sbx build
 
 # Alias omp to always use the sandbox (in ~/.zshrc or ~/.bashrc)
 echo "alias omp='omp-sbx'" >> ~/.zshrc
@@ -45,8 +44,8 @@ echo "alias omp='omp-sbx'" >> ~/.zshrc
 ## Usage
 
 ```bash
-omp                    # interactive TUI (cwd = workspace, ~/.omp shared)
-omp --new              # destroy + create fresh sandbox
+omp                    # interactive TUI (cwd = workspace, private state persists)
+omp --new              # recreate the VM, retaining its OMP state
 omp --yes              # skip the pre-launch "press any key" pause
 omp --version          # passthrough flags to omp
 omp "fix the bug"      # one-shot prompt
@@ -59,45 +58,121 @@ omp --configure --fast openai-codex/gpt-5.6-luna \
 
 ## How it works
 
+
 | Component | File | Purpose |
 |---|---|---|
 | Interactive template | `sbx-kit/Dockerfile` | Extends `shell-docker-nightly` with the nested Docker Engine, OMP binary, browser, and development tools |
 | Interactive kit | `sbx-kit/spec.yaml` | Defines the OMP entrypoint, network allow-list, environment, and agent context |
 | Configure template | `sbx-configure-kit/Dockerfile` | Extends the lightweight non-Docker `shell` template with only the OMP binary |
 | Configure kit | `sbx-configure-kit/spec.yaml` | Defines the parked entrypoint and provider-only network policy used by `omp --configure` |
-| Configure builder | `build-configure.sh` | Builds, tags, and loads only the local configure template |
-| Env (experimental) | `sbx-kit/.sbxenv.yaml` + `omp-sbxenv` | Declarative alternative launcher for scripted/CI use — see [Scripted / CI use](#scripted--ci-use-experimental) |
-| Launcher | `omp-sbx` | Wrapper handling banner, sandbox lifecycle, resume vs new |
-| Model configuration | `omp-sbx-configure-models` | Discovers available models and updates global OMP role and bundled-agent routing |
-| Parallel | `omp-sbx-parallel` | Git worktree-based parallel sandbox launcher |
-| MCP import | `omp-sbx-mcp-import` | Registers Claude Code's MCP servers with sbx - see [MCP servers](#mcp-servers-from-claude-code) |
+| Native Rust CLI | `crates/omp-sbx` | Owns launcher, build, configure, environment, parallel, MCP, and per-sandbox state lifecycle |
+| Per-sandbox state | `crates/omp-sbx/src/state.rs` | Migrates safe legacy files and converges the global configuration seed into isolated persistent state |
+| Native host binary | `install-rust.sh` | Builds and installs `omp-sbx` to `~/.local/bin` |
 | MCP gateway | `sbx-kit/omp-init.sh` | Opt-in wiring that connects omp to the sandbox's MCP gateway |
 | Browser | `sbx-kit/Dockerfile` | Installs architecture-native Chromium for OMP's built-in browser API |
-| Bedrock auth | `sbx-kit/omp-init.sh` | Opt-in AWS SSO profile with browserless renewal - see [Amazon Bedrock](#amazon-bedrock-aws-sso) |
-| Bedrock login | `omp-sbx-aws-login` | Host-side SSO login, shared with every sandbox via `~/.omp/aws-sso-cache` |
-| SSO nudge | `sbx-kit/extensions/aws-sso-nudge.ts` | omp extension: warns before the SSO login lapses, adds `/aws-login` |
+### Per-sandbox OMP state
 
-### Config sharing
+The launcher assigns each sandbox this persistent host directory:
 
-sbx mounts additional workspaces at their **host path** inside the microVM (e.g. `/Users/<user>/.omp`). The kit's startup command symlinks this to `/home/agent/.omp` so omp's `PI_CONFIG_DIR=.omp` resolves correctly.
+```text
+${XDG_STATE_HOME:-$HOME/.local/state}/omp-sbx/sandboxes/<sandbox-name>/.omp
+```
+
+Docker sbx mounts that directory at its host absolute path inside the microVM.
+`omp-init.sh` symlinks it to `/home/agent/.omp`, so OMP's default agent
+directory remains `/home/agent/.omp/agent`. Removing or recreating a VM does not
+remove the host state directory.
+
+The first launch copies regular file-backed data from legacy `~/.omp`, including
+YAML settings, session JSONL, blobs, memories, plugins, and native assets. It
+does not copy SQLite files (by extension or header), WAL/SHM/journal sidecars,
+database quarantine/repair artifacts, symlinks, special files, `aws-config`, or
+`aws-sso-cache`. The legacy tree remains untouched. This intentionally avoids
+copying `agent.db`, `history.db`, `stats.db`, GitHub cache databases, and local
+Mnemopi databases into every sandbox.
+
+`omp-sbx configure` publishes the global seed at `~/.omp/agent/config.yml`.
+Each private state tree applies that seed once per content digest. Repeated
+launches preserve settings changed inside that sandbox; changing the seed
+converges the private `config.yml` on its next launch. Named OMP profiles remain
+inside the same private `.omp` root. User-supplied `PI_CODING_AGENT_DIR`,
+`PI_CODING_AGENT_SESSION_DIR`, or XDG overrides are outside this persistence
+guarantee.
+
+### Model provider credentials
+
+Docker Sandboxes keeps provider credentials on the host. API-key providers
+receive only a proxy-managed sentinel variable; the HTTPS proxy supplies the
+stored key only for the matching API host. OpenAI Codex OAuth uses the same
+model: the sandbox sees `oai-oat01-proxy-managed`, while the real access and
+refresh tokens remain host-side.
+
+| Docker service | Mechanism | OMP environment variable | Proxy hosts |
+|---|---|---|---|
+| `anthropic` | API key | `ANTHROPIC_API_KEY` | `api.anthropic.com` |
+| `openai` | OAuth | `OPENAI_CODEX_OAUTH_TOKEN` | `auth.openai.com`, `chatgpt.com` |
+| `google` | API key | `GEMINI_API_KEY` | `generativelanguage.googleapis.com` |
+| `groq` | API key | `GROQ_API_KEY` | `api.groq.com` |
+| `mistral` | API key | `MISTRAL_API_KEY` | `api.mistral.ai` |
+| `openrouter` | API key | `OPENROUTER_API_KEY` | `openrouter.ai` |
+| `xai` | API key | `XAI_API_KEY` | `api.x.ai` |
+
+On the host, run `sbx secret set <service>` for API keys. For Codex OAuth, run:
+
+```bash
+sbx secret set openai --oauth
+```
+
+Confirm configured services with `sbx secret ls`. The first interactive launch
+asks to approve each schema-v2 credential binding for its provider and domains;
+a non-interactive launch without that approval starts with the credential
+withheld. Interactive `run` and `parallel` creation and recovery preserve the
+terminal so sbx can display and receive that approval. `--yes` skips only the
+launcher's pause, not sbx credential approval. Service-secret changes apply to
+existing local sandboxes in current sbx releases; changing the kit requires
+recreating the sandbox.
+
+Both kits declare OpenAI OAuth only. Select `openai-codex/<model>` in OMP.
+Inside OMP, a runtime `--api-key`, configured model key, or
+stored private `/login` credential can take precedence over the injected
+environment sentinel. Codex web search separately requires OMP-stored OAuth in
+the sandbox's private `agent.db`; it is not an OAuth-injection verification.
+
+After updating the host launcher, rebuild and install it before recreating the
+sandbox. An image build alone does not update the launcher:
+
+```bash
+bash install-rust.sh
+omp-sbx run --new
+```
+
+Accept the OpenAI OAuth/domain approval in the host terminal. To check proxy
+authentication independently of OMP, run inside the sandbox:
+
+```bash
+curl -sS --max-time 30 -o /dev/null -w 'HTTP %{http_code}\n' \
+  -H 'Authorization: Bearer oai-oat01-proxy-managed' \
+  https://chatgpt.com/backend-api/wham/usage
+```
+
+A `200` verifies that this request authenticates; a `401` requires investigating
+the sandbox's credential binding/injection, not deleting OMP session state.
 
 ### Model defaults
 
 `omp --configure` creates a fresh disposable sandbox from the lightweight
 configure image, which has OMP but no nested Docker daemon, browser, language
 servers, or development toolchain. It discovers the model catalog visible with
-the current host-wide sbx provider credentials and shared OMP authentication,
-then opens an Up/Down menu for each missing fast, standard, or deep tier. Each
-model selection is followed by a thinking-level menu.
+the host's approved sbx provider credentials and a private staged OMP agent
+directory, then opens a Ratatui selector for each missing fast, standard, or deep tier.
+Use the arrow keys or `j`/`k` to move, `Enter` to select, `d` to choose the
+suggested default, and `q` or `Escape` to cancel.
 The configure image uses a small argument-tolerant entrypoint that ignores
 sandbox-injected agent or MCP arguments and parks instead of launching an
 interactive OMP session. The helper uses noninteractive `sbx exec` commands,
 removes the sandbox on every exit path, and then returns control to the host.
-If the local `omp-sbx-configure:latest` template is missing or exits immediately
-because it is stale, the helper invokes `build-configure.sh` once. The saved
-Docker image carries that exact tag, so the one-argument `sbx template load`
-supported by the installed CLI restores the local name before creation is
-retried. Custom `OMP_SBX_CONFIGURE_TEMPLATE` values are never built implicitly.
+The native Rust command builds and loads the configure image when needed. Custom
+`OMP_SBX_CONFIGURE_TEMPLATE` values are never built implicitly.
 
 Thinking choices start with **Inherit** (no role-specific override), then **Off**
 (a native disable request), followed by that model's advertised concrete efforts:
@@ -167,17 +242,16 @@ catalog `reasoning` and `thinking` metadata and fails on incompatible output
 rather than guessing capabilities from model names.
 
 The helper preserves unrelated mappings in `modelRoles` and
-`task.agentModelOverrides`, then publishes them to the native host configuration,
-normally the physical target of
-`~/.omp/agent/config.yml`. The helper resolves the guest `~/.omp` mount and
-OMP's active directory separately, requires the active directory to stay within
-that guest mount, then maps its relative path onto the physical host `~/.omp`.
-This handles sbx exposing the host mount at a guest-only path such as
-`/home/agent/.omp`. The resolved host file is printed in the dry-run summary and
-after a successful write. `/var/tmp/omp-configure-models-*` is only a
-project-free guest working directory, so project overrides are never copied
-into global defaults.
-“Global” means shared across this user's `omp-sbx` sandboxes, not all OS users.
+`task.agentModelOverrides`, then publishes them atomically to the host seed at
+`~/.omp/agent/config.yml`. Model discovery and serialization both use the same
+private mounted staging directory; the configure sandbox never mounts legacy
+`~/.omp`. A failed update or readback leaves the host seed untouched.
+
+“Global” means the seed applied across this user's `omp-sbx` state trees, not
+all OS users. On each sandbox's next launch, the state preparer compares the
+seed digest with that sandbox's marker. A changed seed replaces the private
+`agent/config.yml` once; an unchanged seed preserves settings changed with
+`/settings` or `omp config set` inside that sandbox.
 
 A successful configuration also sets global `modelRoleStorage: project`, enabling
 global/project save choices in `/model` → Roles. To override a role for one
@@ -186,14 +260,9 @@ Native `.omp/config.yml` role keys override matching global roles; other roles
 continue to inherit global defaults. The helper never changes project files.
 The storage preference controls hub save choices, not the helper's write scope.
 
-The helper copies the current native host file into a private mounted staging
-directory, lets OMP serialize and verify all three settings there, and only then
-atomically replaces the host `config.yml`. A failed update or readback leaves the
-host file untouched; semantic rollback is confined to the disposable staging
-copy.
 An OMP process reads these settings at startup. Exit and relaunch it after
-configuration; if the launcher reattaches to the already-running process, use
-`omp --new` to restart the sandbox process while retaining shared session data.
+configuration. `omp --new` recreates the VM while retaining that sandbox's
+private sessions and other state.
 
 The helper does not need a separate PATH symlink. Catalog visibility confirms
 that OMP can discover a selector, but actual provider requests remain subject
@@ -235,11 +304,10 @@ Compose pulls and `up` without `--build` work normally; use
 
 Project edits do not change an approved snapshot, including after a normal
 reattach, restart, or `--new`. Apply a host-reviewed change explicitly:
-
 ```bash
 omp-sbx --refresh-image-policy
-omp-sbx-parallel --branch feature-x --refresh-image-policy
-omp-sbxenv --refresh-image-policy
+omp-sbx parallel --branch feature-x --refresh-image-policy
+omp-sbx env --refresh-image-policy
 ```
 
 The refresh recreates the affected sandbox/environment so the new snapshot is
@@ -252,13 +320,8 @@ remove the plugin or reconfigure the daemon. Docker AuthZ also does not cover
 native/upgraded gRPC, and non-JSON build contexts are enforced by the CLI
 wrapper plus Buildx policy rather than inspected by AuthZ.
 
-`./build.sh` verifies this contract by creating a throwaway sandbox and running:
-
-```bash
-test -S /var/run/docker.sock
-docker version
-docker ps
-```
+`omp-sbx build` verifies this contract by creating throwaway sandboxes and running
+the Docker socket, Docker CLI, and browser smoke checks.
 
 ### GitHub auth forwarding
 
@@ -285,14 +348,12 @@ If `gh auth status` fails with `401`, ensure the GitHub secret is stored (`sbx s
 
 ### MCP servers from Claude Code
 
-```bash
-omp-sbx-mcp-import --dry-run   # read ~/.claude.json, print the plan
-omp-sbx-mcp-import --auth      # register, then authorize the remote ones
-omp-sbx-mcp-import --load      # attach them to this directory's sandbox
-```
+omp-sbx mcp-import --dry-run   # read ~/.claude.json, print the plan
+omp-sbx mcp-import --auth      # register, then authorize the remote ones
+omp-sbx mcp-import --load      # attach them to this directory's sandbox
 
 sbx keeps its own MCP registry and serves it to a sandbox through a gateway.
-`omp-sbx-mcp-import` copies the servers out of `~/.claude.json` (plus a project
+`omp-sbx mcp-import` copies the servers out of `~/.claude.json` (plus a project
 `.mcp.json`, or any `--file`) into that registry. It is idempotent: a second run
 reports what already exists and changes nothing.
 
@@ -305,7 +366,7 @@ sandbox or depends on a host keychain/browser session there.
 
 | Route | Command | Trade |
 |---|---|---|
-| Live attach | `omp-sbx-mcp-import --load` | No restart; the agent also gets the gateway's `mcp-add` / `mcp-find` |
+| Live attach | `omp-sbx mcp-import --load` | No restart; the agent also gets the gateway's `mcp-add` / `mcp-find` |
 | Fixed at create | `OMP_SBX_STATIC_MCP=notion,searxng omp-sbx --new` | Set cannot change without `--new`; the agent cannot register more |
 
 Loading into a sandbox created with `--static-mcp` misbehaves - the second load
@@ -334,116 +395,12 @@ The tools arrive named `mcp__sbx_gateway_<tool>`, so `searxng_web_search` become
 session.
 
 `omp-init.sh` writes the server definition into a `--plugin-dir` root under
-`~/.cache` inside the sandbox, not an `mcp.json`. Every config dir omp looks in
-for `mcp.json` is a host mount here, so writing one would leave a URL in the
-shared host config that resolves only inside a sandbox.
+`~/.cache` inside the sandbox, not an `mcp.json`. OMP's config directories are
+either persistent private state or project files, so writing the sandbox-only
+gateway URL there would outlive the endpoint that serves it.
 
 Changing `OMP_SBX_MCP_GATEWAY` takes effect on the next launch. Changing
-`omp-init.sh` needs `./build.sh` and `omp --new`.
-
-### Amazon Bedrock (AWS SSO)
-
-Off by default. A project turns it on with one line in its `.env`:
-
-```bash
-OMP_SBX_AWS_PROFILE=infra-dev-bedrock
-OMP_SBX_AWS_REGION=us-east-1          # optional, defaults to us-east-1
-```
-
-Define that profile once in `~/.omp/aws-config` on the host. The file uses AWS
-CLI config syntax and holds no secrets:
-
-```ini
-[sso-session my-sso]
-sso_start_url = https://d-xxxxxxxxxx.awsapps.com/start
-sso_region = us-east-1
-sso_registration_scopes = sso:account:access
-
-[profile infra-dev-bedrock]
-sso_session = my-sso
-sso_account_id = 000000000000
-sso_role_name = Bedrock-Invoke-Only
-region = us-east-1
-```
-
-`~/.omp` is already bind-mounted, so editing `aws-config` takes effect on the
-next session - no rebuild.
-
-**Log in once, from the host, and every sandbox shares it.** Run:
-
-```bash
-omp-sbx-aws-login
-```
-
-from a project with `OMP_SBX_AWS_PROFILE` set (or `omp-sbx-aws-login --profile
-<name>` anywhere). It opens the user's interactive browser on the host and
-writes the resulting SSO token into `~/.omp/aws-sso-cache`, which
-every sandbox symlinks `~/.aws/sso/cache` to. A brand new sandbox, or one
-recreated with `--new`, picks up an already-valid session immediately; nothing
-about the token needs redoing per sandbox.
-
-Unlike `aws-config` above, this directory does hold something live: a
-refreshable SSO session, scoped to the role in that profile. Sharing it is the
-same trust boundary `~/.omp` already carries for everything else in it - one
-identity, shared across this host's own sandboxes.
-
-A sandbox can still log in on its own if you'd rather not leave it: run
-`/aws-login` once the session starts, which the nudge extension below handles
-with a device-code flow. The sandbox's headless Chromium cannot complete an
-interactive user login, and the alternative PKCE flow redirects to a loopback
-port that the host browser cannot reach. That login is shared too, through the
-same symlink.
-
-**Renewal is browserless.** `omp-init.sh` generates an `omp-bedrock` profile
-whose `credential_process` calls `aws configure export-credentials`. omp reads
-the SSO access token but not the refresh token stored next to it, so on its own
-it treats an expired token as fatal. The AWS CLI does read that refresh token,
-so routing through it renews silently. This requires the `[sso-session]` profile
-shape above - a legacy profile with an inline `sso_start_url` gets no refresh
-token from the CLI.
-
-Three lifetimes stack up, and only the longest one needs you at a browser:
-
-| Layer | Typical lifetime | Renewal |
-|---|---|---|
-| Role credentials | 12 hours | Minted from the access token |
-| SSO access token | 1 hour | Silent, `grantType: refresh_token` |
-| Client registration | ~31 days | `aws sso login`, opening a URL |
-
-Read your own values from `~/.aws/sso/cache/*.json`: `expiresAt` is the access
-token and `registrationExpiresAt` on the same entry is the registration. The role
-credentials carry their own `Expiration`, visible via
-`aws configure export-credentials`.
-
-The role credentials are what actually sign a Bedrock request, and omp caches
-them for their full 12 hours. Only when they lapse does it re-read the SSO access
-token - which is an hour old at most, and which omp cannot renew. So without
-`credential_process` a session dies at the 12 hour mark, and a session started
-more than an hour after the last refresh fails immediately. Sending it through
-the CLI removes both cliffs, because the CLI renews the access token from the
-refresh token with no browser.
-
-One caveat worth knowing: `aws sso login` restarts authorization from scratch
-every time, even when the cached token is still valid. Only the credential path
-(`aws configure export-credentials`) refreshes silently, which is why the
-generated profile uses it.
-
-**The nudge extension** (`sbx-kit/extensions/aws-sso-nudge.ts`) covers the
-30-day boundary, which nothing renews on its own. Loaded only when Bedrock is
-on, it checks every 15 minutes and warns in the chat once fewer than 2 days
-remain (`OMP_SBX_AWS_SSO_WARN_DAYS` overrides the threshold). If credentials stop
-working mid-session, it runs the device-code login itself and puts the URL in the
-chat - open it on your host and the session recovers without a restart.
-
-It stays out of the status line except while a login is waiting for approval.
-The registration is weeks from expiry nearly always, so a standing countdown is
-noise. Read the current values from `~/.aws/sso/cache/*.json` when you want them.
-
-`AWS_CA_BUNDLE` is set in `spec.yaml` because botocore ignores the OS trust
-store in favor of its own bundle, which the sbx TLS proxy would otherwise break.
-
-Adding a region means adding its `bedrock-runtime`, `oidc`, `portal.sso`, and
-`sts` hosts to the network allow-list in `sbx-kit/spec.yaml`.
+`omp-init.sh` needs `omp-sbx build` and `omp-sbx --new`.
 
 ### LSP servers
 
@@ -455,12 +412,10 @@ contract changes or any required command is missing.
 
 **Installation is split by distribution mechanism:**
 
-| Part | Location | Details |
-|---|---|---|
 | Package-manager servers | `sbx-kit/Dockerfile` | Pinned npm, Go, uv, Ruby, Kotlin, Erlang, and Swift installs |
 | Native/toolchain servers | `sbx-kit/install-native-lsps.sh` | Architecture-specific, pinned, checksum-verified releases and source builds |
-| User registration overrides | `~/.omp/lsp.yml` on the host | Live through the `~/.omp` bind mount; no image rebuild needed |
-
+| Image-owned project registrations | `sbx-kit/omp-lsp/lsp.json` | Baked into the interactive image and loaded with `--plugin-dir`; currently Azure Pipelines |
+| User registration overrides | `/home/agent/.omp/agent/lsp.yml` | Live in that sandbox's private persistent state; no image rebuild needed |
 Downloaded tool artifacts live under `/home/agent/.local/share/<tool>`.
 Stable command entry points live in `/home/agent/.local/bin`; NVM-managed
 Node 20/22/24/26, Cargo, GHCup, Swift, Go, Bun, Ruby, and pnpm paths remain
@@ -477,19 +432,34 @@ from `lsp status` means no workspace file matched; it does not mean the
 configuration is missing.
 
 `rootMarkers` such as `.git`, `go.mod`, and `package.json` select the project
-root but do not start a server without a matching file type. Entries in the
-host's `~/.omp/lsp.yml` can replace or extend OMP's defaults for the next
-session.
+root but do not start a server without a matching file type. The image-owned
+Azure Pipelines registration uses the root marker `pipelines`, YAML extensions
+`.yaml` and `.yml`, and the command
+`azure-pipelines-language-server --stdio`. It therefore activates for YAML
+files in a workspace whose root contains a `pipelines/` directory. OMP routes
+by file type and root marker; it cannot restrict the registration to only
+recursive `pipelines/**/*.{yaml,yml}` paths within that workspace.
+
+The Azure registration is immutable image content under
+`/opt/omp-sbx/lsp/`; do not copy it into private persistent
+`/home/agent/.omp/agent/lsp.yml`. Entries in the private file can replace or
+extend OMP's defaults and the image registration for the next session.
 
 #### Adding or changing a server
 
 1. Pin and install its command in `sbx-kit/Dockerfile` or
    `sbx-kit/install-native-lsps.sh`. Verify upstream checksums or signatures
    when published; otherwise pin a reviewed checksum or source commit.
-2. If OMP does not register it by default, add its command, arguments, file
-   types, and root markers to `~/.omp/lsp.yml`.
-3. Rebuild and load the image with `./build.sh`, then start a fresh sandbox
-   with `omp --new`. Registration-only changes need only a fresh session.
+2. For an image-owned custom registration, add its manifest under
+   `sbx-kit/omp-lsp/` and keep the corresponding command in the image. Load
+   that directory with the guest startup's `--plugin-dir` rather than writing
+   to the sandbox's private durable `~/.omp/agent/lsp.yml`.
+3. Use `~/.omp/agent/lsp.yml` only for sandbox-specific overrides and
+   extensions that should live outside the image.
+4. Rebuild and load the image with `omp-sbx build`, then start a fresh sandbox
+   with `omp-sbx --new`. Registration-only changes need a fresh session, and
+   an existing sandbox does not receive a rebuilt image until it is recreated.
+
 
 ### Browser automation
 
@@ -524,8 +494,8 @@ The sbx TLS proxy injects its CA into the container trust store, so Chromium
 keeps certificate validation enabled. Do not set
 `PUPPETEER_PROXY_IGNORE_CERT_ERRORS`.
 
-Changing the Playwright Chromium version requires a rebuild (`./build.sh`) and
-a fresh sandbox (`omp --new`).
+Changing the Playwright Chromium version requires `omp-sbx build` and a fresh
+sandbox (`omp-sbx --new`).
 
 ### Security
 
@@ -542,12 +512,12 @@ All security is handled by the sbx microVM — no manual `cap_drop`, `gosu`, `um
 
 ## Parallel sessions (git worktrees)
 
-`omp-sbx-parallel` creates a git worktree on a separate branch and launches a dedicated sandbox for it. Run it multiple times to work on multiple tasks in parallel — each gets its own worktree, branch, and sandbox.
+`omp-sbx parallel` creates a git worktree on a separate branch and launches a dedicated sandbox. Run it multiple times to work on multiple tasks in parallel.
 
 ```bash
-omp-sbx-parallel                          # interactive: pick existing branch or create new
-omp-sbx-parallel --new fix-auth-bug       # create new branch + worktree + sandbox
-omp-sbx-parallel --branch feature-x       # use existing branch in a new worktree
+omp-sbx parallel                          # interactive branch selection
+omp-sbx parallel --new fix-auth-bug       # create new branch and worktree
+omp-sbx parallel --branch feature-x       # use existing branch
 ```
 
 On exit (interactive mode), you're offered cleanup:
@@ -559,7 +529,7 @@ Worktrees are created as siblings of the repo root: `~/src/myproject@fix-auth-bu
 
 ### VS Code worktree integration
 
-`omp-sbx-parallel` maintains a multi-root `.code-workspace` file at the repo root (`<repo-name>.code-workspace`) so VS Code can display all active worktrees as named roots in one window. The file is gitignored (`*.code-workspace`) — it's machine-local, never committed.
+`omp-sbx parallel` maintains a multi-root `.code-workspace` file at the repo root (`<repo-name>.code-workspace`) so VS Code can display all active worktrees as named roots in one window. The file is gitignored (`*.code-workspace`) — it is machine-local and never committed.
 
 **What happens automatically:**
 
@@ -576,48 +546,44 @@ Worktrees are created as siblings of the repo root: `~/src/myproject@fix-auth-bu
 {
   "label": "agent: feature-x",
   "type": "shell",
-  "command": "omp-sbx-parallel --branch feature-x",
+  "command": "omp-sbx parallel --branch feature-x",
   "options": { "cwd": "${workspaceFolder:myrepo feature-x}" }
 }
 ```
 
-Requires `jq` on the host (silently skips if unavailable). For full agent instructions, see [`INSTRUCTIONS.md`](INSTRUCTIONS.md).
+For full agent instructions, see [`INSTRUCTIONS.md`](INSTRUCTIONS.md).
 
 **VS Code settings:** enable `git.detectWorktrees` to auto-list all worktrees in Source Control, even ones created outside VS Code.
 
 ## Scripted / CI use (experimental)
 
-`omp-sbxenv` is an alternative launcher built on Docker sbx's declarative
-`.sbxenv.yaml` + `sbx env` commands (sbx v0.39+; Docker marks `sbx env`
-experimental and subject to change). It fits headless automation better than
-`omp-sbx`'s interactive create/pause/attach flow:
+`omp-sbx env` is the declarative launcher built on Docker sbx's `sbx env`
+commands (sbx v0.43+). It fits headless automation better than the interactive
+`omp-sbx run` flow:
 
 ```bash
-omp-sbxenv --version   # create (if needed) + run a one-shot command
-omp-sbxenv --new        # remove + recreate the environment
+omp-sbx env --version
+omp-sbx env --new
 ```
 
-Under the hood this templates `sbx-kit/.sbxenv.yaml` with `${VAR}` values the
-script exports (workspace path, kit path, sandbox name) and calls
-`sbx env create` / `sbx env exec` / `sbx env rm` directly — no host-mounted
-secret files, since `.sbxenv.yaml` (unlike `spec.yaml`) expands `${VAR}`
-placeholders for real.
+The Rust command supplies `kitDir`, `workspace`, `ompState`, and `dockerPolicy`
+to `sbx-kit/sbxenv.yaml` with repeatable `--env-arg` flags on every create,
+run, exec, and remove operation. It also supplies the same explicit sandbox
+name and environment-file path every time. A changed kit or incompatible
+legacy `~/.omp` mount causes documented `sbx env rm --force` recreation while
+the private host state directory remains intact.
 
-**Known gaps vs `omp-sbx`:**
+**Known gaps vs `omp-sbx run`:**
 - No force-quit recovery cascade (re-attach → restart → recreate) — just
   create-or-reuse.
-- No `~/.config/gh` forwarding. A static env file can't conditionally mount a
-  path that may not exist on every host, and `sbx env create` prompts
-  interactively — hanging in non-interactive/CI contexts — if
-  `additionalWorkspaces` points at a missing directory.
-- Re-running `sbx env run` on an existing environment only re-applies
-  env/MCP changes; other `.sbxenv.yaml` edits need `--new`.
+- No `~/.config/gh` forwarding. A static env file cannot conditionally mount a
+  path that may not exist on every host without risking an interactive prompt
+  in CI.
 
-For day-to-day interactive use, stick with `omp-sbx`.
+For day-to-day interactive use, use `omp-sbx run`.
 
 ## Rebuild after omp upgrade
 
 ```bash
-cd ~/src/github.com/mikeatlas/omp-sbx
-./build.sh
+omp-sbx build
 ```

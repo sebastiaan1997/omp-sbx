@@ -1,0 +1,23 @@
+schemaVersion: "1"
+agent: omp
+kits:
+  - "${{ env.args.kitDir }}"
+workspace: "${{ env.args.workspace }}"
+additionalWorkspaces:
+  # Per-sandbox OMP state. The launcher owns and retains this host directory
+  # when an environment is recreated.
+  - path: "${{ env.args.ompState }}"
+  # Per-project Docker image allowlist, mounted separately from the rw workspace.
+  - path: "${{ env.args.dockerPolicy }}"
+    readOnly: true
+sandboxOptions:
+  template: omp-sbx:latest
+args:
+  kitDir:
+    required: true
+  workspace:
+    required: true
+  ompState:
+    required: true
+  dockerPolicy:
+    required: true

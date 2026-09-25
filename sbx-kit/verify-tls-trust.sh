@@ -12,7 +12,7 @@ set -euo pipefail
 PROXY="gateway.docker.internal:3128"
 CA_CERT="/usr/local/share/ca-certificates/proxy-ca.crt"
 CA_BUNDLE="/etc/ssl/certs/ca-certificates.crt"
-ALLOWED_HOST="registry.npmjs.org"        # in spec.yaml permissions.network.allow
+ALLOWED_HOST="index.crates.io"            # in spec.yaml permissions.network.allow
 BLOCKED_HOST="example.com"               # not in permissions.network.allow
 
 PASS=0

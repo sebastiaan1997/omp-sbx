@@ -2,42 +2,40 @@
 
 ## Project Overview
 
-`omp-sbx` packages Oh My Pi (OMP) into Docker Sandboxes (`sbx`) microVMs. Root Bash commands build the sandbox image, create or recover per-project sandboxes, forward selected host state, and launch OMP. The repository is infrastructure-oriented: there is no application package manifest, conventional `src/` tree, or package-managed test suite.
+`omp-sbx` packages Oh My Pi (OMP) into Docker Sandboxes (`sbx`) microVMs. A native Rust CLI owns host launch, worktree, configuration, build, MCP, and persistent-state workflows; shell scripts in `sbx-kit/` run only inside the guest image. The repository is infrastructure-oriented: there is no application package manifest or conventional `src/` tree.
 
 ## Architecture & Data Flow
 
-1. Host launchers (`omp-sbx`, `omp-sbx-parallel`, `omp-sbxenv`) parse launcher-only flags and forward all remaining arguments to OMP.
-2. `sbx-preflight.sh` locates/bootstraps `sbx`, normalizes sandbox names, and removes sandboxes created from a stale kit path.
-3. Launchers create or attach to a sandbox defined by `sbx-kit/spec.yaml` and based on the image built from `sbx-kit/Dockerfile`.
-4. Inside the sandbox, `sbx-kit/omp-init.sh` maps host mounts to stable guest paths, reads supported project `.env` keys, configures optional AWS/MCP/skills integration, then uses `exec omp ...`.
-5. `sbx-kit/extensions/aws-sso-nudge.ts` is an event-driven OMP extension. It checks AWS credentials asynchronously, owns timer/login state in a closure, and cleans up its interval on session shutdown.
+1. The Rust CLI (`crates/omp-sbx`) parses launcher-only flags and forwards remaining arguments to OMP.
+2. `state.rs` assigns each exact sandbox name a private persistent `.omp` tree and safely migrates eligible legacy file-backed state.
+3. Launch commands materialize the embedded kits, prepare Docker image policy, recreate incompatible old mounts, and create or attach to the named sandbox.
+4. Inside the sandbox, `sbx-kit/omp-init.sh` maps host mounts to stable guest paths, configures optional MCP and shared skills, then uses `exec omp ...`.
+5. Schema-v2 credentials in each `spec.yaml` keep API keys and OpenAI Codex OAuth tokens host-side behind the sbx proxy.
 
-Keep the host/guest boundary explicit. Host scripts own filesystem paths, Git/worktrees, browser authentication, MCP registry operations, and sandbox lifecycle. `omp-init.sh` owns guest-local convergence before OMP starts. `spec.yaml` owns runtime policy, network access, environment, and startup mount wiring.
+Keep the host/guest boundary explicit. Rust owns host filesystem paths, Git/worktrees, MCP registry operations, persistent OMP state, and sandbox lifecycle. `omp-init.sh` owns guest-local convergence before OMP starts. `spec.yaml` owns runtime policy, network access, credential injection, environment, and startup mount wiring.
 
-Changes to launch/recovery behavior usually require comparing both `omp-sbx` and `omp-sbx-parallel`; they intentionally differ in sandbox lifetime, mounts, naming, and cleanup. Preserve the shared `sandbox_name_for` contract or helpers will address different sandboxes.
+Changes to launch/recovery behavior require comparing `commands/run.rs`, `commands/parallel.rs`, and `commands/env.rs`; they intentionally differ in sandbox lifetime, mounts, naming, and cleanup. Preserve the shared `sandbox_name_for` contract because it is also the persistent-state identity.
 
 ## Key Directories
 
-- `sbx-kit/`: image, sandbox policy, guest initialization, runtime verification, and OMP extensions.
-- `sbx-kit/extensions/`: runtime TypeScript extensions loaded by `omp-init.sh`.
-- Repository root: public host-side Bash commands and shared preflight logic.
+- `crates/omp-sbx/`: native host CLI, lifecycle policy, state migration, and tests.
+- `sbx-kit/`: interactive image, sandbox policy, guest initialization, runtime verification, and OMP plugins.
+- `sbx-configure-kit/`: minimal image and policy used by model configuration.
 
-There are no conventional source, test, CI, or examples directories.
+There is no package-managed application test framework, CI workflow, or coverage threshold.
 
 ## Development Commands
 
 ```bash
-./build.sh                              # authoritative build, load, and smoke verification
-OMP_VERSION=X.Y.Z ./build.sh            # build a selected OMP baseline
-RELEASE_COOLDOWN_DAYS=0 OMP_VERSION=latest ./build.sh
-./omp-sbx                               # create/resume an interactive sandbox
-./omp-sbx --new                         # recreate before launch
-./omp-sbx "fix the bug"                 # one-shot OMP invocation
-./omp-sbx-parallel --new feature-name   # new branch/worktree session
-./omp-sbx-parallel --branch feature-x   # existing branch/worktree session
-./omp-sbx-mcp-import --dry-run          # preview MCP imports
-./omp-sbx-aws-login --profile NAME      # host-side AWS SSO login
-./omp-sbxenv --version                  # experimental sbx-env one-shot path
+cargo test -p omp-sbx
+cargo check -p omp-sbx
+cargo run -p omp-sbx -- run
+cargo run -p omp-sbx -- run --new
+cargo run -p omp-sbx -- parallel --new feature-name
+cargo run -p omp-sbx -- parallel --branch feature-x
+cargo run -p omp-sbx -- mcp-import --dry-run
+cargo run -p omp-sbx -- env -- --version
+cargo run -p omp-sbx -- build
 ```
 
 Inside a running sandbox, run the manual TLS/network diagnostic with:
@@ -46,56 +44,55 @@ Inside a running sandbox, run the manual TLS/network diagnostic with:
 bash sbx-kit/verify-tls-trust.sh
 ```
 
-No repository-defined install, lint, format, typecheck, unit-test, or coverage command exists. Do not invent `npm`, `pnpm`, ShellCheck, or other project commands. Use `./build.sh` rather than a direct `docker build`; it also loads the template and exercises the built image.
+Do not invent npm, pnpm, ShellCheck, or other project commands. `omp-sbx build` is the authoritative image build, template load, and smoke flow; do not substitute a direct `docker build`.
 
 ## Code Conventions & Common Patterns
 
-- Bash entry points use `#!/usr/bin/env bash` and `set -euo pipefail`.
-- Resolve symlinked launcher paths before locating repository-relative files. Reuse `sbx-preflight.sh` instead of duplicating sbx discovery or sandbox naming.
-- Store command arguments in quoted arrays (`MOUNTS`, `CREATE_OPTS`, `OMP_ARGS`); never assemble executable command strings.
-- Shell functions use `snake_case`; environment/configuration constants use uppercase `OMP_SBX_*` names. TypeScript uses `camelCase` and uppercase constants.
-- Send diagnostics through the existing `log` helpers to stderr. Enable colors only for a TTY and read interactive prompts from `/dev/tty`.
-- Use `exec` at terminal process boundaries so signals and status reach `sbx run`, `sbx exec`, or `omp` directly.
-- Keep strict failures for prerequisites and validation. Use `|| true` only for expected absence, idempotent cleanup, or a failure deliberately classified by the next operation.
-- Preserve idempotence: exact sandbox-name matching, safe symlink replacement, inspect-before-add for MCP, stable sorted parser output, and temporary-file-plus-`mv` updates.
-- `.env` is parsed as simple first-match `KEY=value` text, not sourced as shell. Do not add interpolation assumptions. Supported keys include `OMP_SBX_AWS_PROFILE`, `OMP_SBX_AWS_REGION`, and `OMP_SBX_MCP_GATEWAY`.
+- Rust functions and modules use `snake_case`; types use `UpperCamelCase`; environment/configuration constants use uppercase `OMP_SBX_*` names.
+- Pass external command arguments as typed arrays through `CommandSpec`; never assemble executable shell command strings.
+- Diagnostics go to stderr. Interactive prompts must be gated on a TTY; one-shot paths must remain non-blocking.
+- Keep strict failures for prerequisites and validation. Ignore status only for expected absence or idempotent cleanup.
+- Preserve idempotence: exact sandbox-name matching, safe symlink replacement, inspect-before-add for MCP, stable sorted parser output, and temporary-file-plus-rename publication.
+- Legacy `.env` parsing is simple first-match `KEY=value` text, not sourced shell. `OMP_SBX_MCP_GATEWAY` is the supported guest startup key.
 - Startup ordering matters: configuration OMP must see belongs in `omp-init.sh`; the `spec.yaml` startup hook runs concurrently.
-- Interactive flows may pause or prompt. One-shot flows must remain non-blocking and still pass through `omp-init.sh`.
-- The AWS extension must keep login single-flight, suppress duplicate warnings, stream device-code output before process exit, and clear lifecycle timers.
-- If creating/removing worktrees outside `omp-sbx-parallel`, follow `INSTRUCTIONS.md`: update the gitignored `<repo>.code-workspace`, keep the main checkout first, and never commit that file.
+- Per-sandbox OMP state is keyed by exact `sandbox_name_for` output. Never remount legacy `~/.omp` into a sandbox or copy SQLite databases, sidecars, repair artifacts, symlinks, special files, or retired AWS state into a private tree.
+- Configuration seeding is digest-based: unchanged legacy `agent/config.yml` must preserve private edits; a changed seed applies once.
+- All sbx command paths require 0.43.0 or newer. Declarative environment operations must use the same `--name`, `sbxenv.yaml` path, and complete `--env-arg` set.
+- If creating/removing worktrees outside `commands/parallel.rs`, follow `INSTRUCTIONS.md`: update the gitignored `<repo>.code-workspace`, keep the main checkout first, and never commit that file.
 
 ## Important Files
 
-- `omp-sbx`: canonical launcher, mounts, attach/recovery state machine, and one-shot path.
-- `sbx-preflight.sh`: shared host prerequisites, sandbox naming, and stale-kit detection.
-- `omp-sbx-parallel`: branch/worktree lifecycle and VS Code workspace updates.
-- `omp-sbx-mcp-import`: Claude MCP JSON parsing and sbx MCP registration/auth/load flow.
-- `omp-sbx-aws-login`: host AWS profile import, cache sharing, and browser login.
-- `omp-sbxenv`: experimental scripted/CI path; requires sbx v0.39+.
-- `build.sh`: authoritative image build, template load, and smoke checks.
-- `sbx-kit/Dockerfile`: sandbox toolchain and version pins.
-- `sbx-kit/spec.yaml`: network allow-list, environment, generated sandbox instructions, and startup wiring.
+- `crates/omp-sbx/src/commands/run.rs`: canonical launcher and attach/recovery state machine.
+- `crates/omp-sbx/src/commands/parallel.rs`: branch/worktree lifecycle and disposable VM cleanup.
+- `crates/omp-sbx/src/commands/env.rs`: declarative `sbx env` path.
+- `crates/omp-sbx/src/state.rs`: private state location, migration exclusions, locking, and seed convergence.
+- `crates/omp-sbx/src/preflight.rs`: sbx discovery, naming, stale-kit, and incompatible-mount checks.
+- `crates/omp-sbx/src/commands/mcp_import.rs`: Claude MCP parsing and sbx MCP registration/auth/load flow.
+- `crates/omp-sbx/src/commands/build.rs`: authoritative image build, load, and smoke checks.
+- `sbx-kit/Dockerfile`: interactive sandbox toolchain and version pins.
+- `sbx-kit/spec.yaml`: network allow-list, schema-v2 credentials, environment, generated instructions, and startup wiring.
 - `sbx-kit/omp-init.sh`: guest entry point and final OMP argument construction.
-- `sbx-kit/extensions/aws-sso-nudge.ts`: AWS SSO session extension.
+- `sbx-kit/sbxenv.yaml`: declarative environment definition.
 - `sbx-kit/verify-tls-trust.sh`: manual aggregate TLS/proxy/network-policy verifier.
 - `README.md`: operational runbook; verify claims against implementation when changing behavior.
 
 ## Runtime/Tooling Preferences
 
-- Host runtime: Bash plus authenticated Docker `sbx`; image builds also require Docker. `~/.omp` must already exist for normal launch.
-- Helper-specific host tools: Git for parallel sessions, Python 3 for MCP import; `fzf` and `jq` are optional enhancements.
-- There is no repository package manager or lockfile. pnpm, npm/Corepack, Bun, uv, Go tooling, and RubyGems are sandbox payloads, not repository development managers.
+- Host runtime: the Rust binary plus authenticated Docker `sbx` 0.43.0 or newer; image builds also require Docker.
+- Helper-specific host tools: Git for parallel sessions and Python 3 for MCP import.
+- There is no repository package manager or lockfile for guest payload tooling. pnpm, npm/Corepack, Bun, uv, Go tooling, and RubyGems are sandbox payloads, not repository development managers.
 - The sandbox is Linux (`amd64` or `arm64`), user `agent`, home `/home/agent`, workspace `/home/agent/workspace`. Its Docker socket is microVM-local; never mount the host Docker socket.
-- Treat `~/.omp` as durable user data. It can contain sessions, skills, memories, MCP state, and AWS SSO cache.
-- Network access is allow-listed in `sbx-kit/spec.yaml`. Adding an external service or AWS region requires corresponding policy entries.
-- Keep downloaded tools/version checks architecture-aware and pinned where the existing implementation pins them. Playwright projects must match the image's exact `1.63.0` release and keep certificate verification enabled.
-- Known drift: normal `./build.sh` currently supplies OMP `18.1.10`, while the Dockerfile default is `18.1.21`. `install-native-lsps.sh` is not invoked by the observed build path despite README claims. Do not describe either as resolved without changing and verifying the implementation.
+- Durable state lives under `${XDG_STATE_HOME:-$HOME/.local/state}/omp-sbx/sandboxes/<name>/.omp`; legacy `~/.omp` is only a migration source and global configuration seed.
+- Network access is allow-listed in `sbx-kit/spec.yaml`. OpenAI OAuth needs `auth.openai.com` and `chatgpt.com`; generic Bedrock provider reachability retains only the Bedrock API hosts.
+- Keep downloads architecture-aware and pinned where the implementation pins them. Playwright projects must match the image's exact `1.63.0` release and keep certificate verification enabled.
+- Known drift: the Rust build command currently supplies OMP `18.1.10`, while the interactive Dockerfile default is `18.1.21`. Do not describe this as resolved without changing and verifying both.
 
 ## Testing & QA
 
-There is no test framework, paired test-file convention, CI workflow, coverage configuration, or coverage threshold. QA is system-level:
+The Rust unit suite is deterministic and does not require sbx. Runtime verification is system-level:
 
-- `./build.sh` creates disposable sandbox `omp-verify`, waits for its private Docker daemon, runs `omp-init.sh --version`, and checks headless Chromium output. This is expensive but is the repository's authoritative verification path.
-- `sbx-kit/verify-tls-trust.sh` runs numbered certificate, proxy, allowed-host, and blocked-host checks inside a sandbox. It reports all checks through `_pass`/`_fail` and exits nonzero if any fail.
+- `cargo test -p omp-sbx` covers parsing, state migration/exclusions, seed convergence, and host logic.
+- `omp-sbx build` creates disposable smoke sandboxes, runs the guest entrypoint, verifies `omp config path`, and checks the configure image boundary. This is expensive and requires Docker plus authenticated sbx.
+- `sbx-kit/verify-tls-trust.sh` runs numbered certificate, proxy, allowed-host, and blocked-host checks inside a sandbox.
 
-For image, startup, Docker, or browser changes, run `./build.sh`. For TLS, proxy, CA, or network-policy changes, additionally run the TLS verifier inside the built sandbox and keep its constants aligned with `sbx-kit/spec.yaml`. Prefer observable contracts—socket/executable presence, command status, certificate verification, policy outcome, and rendered browser output—over source-text assertions.
+For image, startup, Docker, browser, credential, or network changes, run `omp-sbx build`. For TLS, proxy, CA, or network-policy changes, additionally run the TLS verifier inside the built sandbox and keep its constants aligned with `sbx-kit/spec.yaml`. Prefer observable contracts—mount paths, socket/executable presence, command status, certificate verification, policy outcome, and rendered browser output—over source-text assertions.

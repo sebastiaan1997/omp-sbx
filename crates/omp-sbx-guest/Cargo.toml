@@ -1,0 +1,41 @@
+[package]
+name = "omp-sbx-guest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+atomic-write-file.workspace = true
+clap.workspace = true
+hex.workspace = true
+libc.workspace = true
+nix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+time.workspace = true
+tokio.workspace = true
+yaml-rust2.workspace = true
+
+[[bin]]
+name = "omp-sbx-init"
+path = "src/bin/init.rs"
+
+[[bin]]
+name = "omp-sbx-docker-policy"
+path = "src/bin/docker_policy.rs"
+
+[[bin]]
+name = "omp-sbx-docker"
+path = "src/bin/docker.rs"
+
+[[bin]]
+name = "omp-sbx-configure-init"
+path = "src/bin/configure_init.rs"
+
+[[bin]]
+name = "omp-sbx-verify-tls"
+path = "src/bin/verify_tls.rs"

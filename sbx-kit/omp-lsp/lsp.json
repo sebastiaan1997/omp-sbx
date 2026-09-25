@@ -1,0 +1,11 @@
+{
+  "servers": {
+    "azure-pipelines-language-server": {
+      "command": "azure-pipelines-language-server",
+      "args": ["--stdio"],
+      "fileTypes": [".yaml", ".yml"],
+      "languageId": "yaml",
+      "rootMarkers": ["pipelines"]
+    }
+  }
+}

@@ -22,16 +22,24 @@ ARG PLAYWRIGHT_VERSION=1.63.0
 ARG KOTLIN_LSP_VERSION=263.4702.0
 ARG ERLANG_LS_REV=ed1daaa4d94d2dc9c9d3f934c704ee4dafb176c6
 ARG SWIFT_VERSION=6.2
+ARG RUST_VERSION=1.89.0
+ARG RUSTUP_VERSION=1.29.1
+
 
 
 # ── Dev tools and Chromium's shared libraries ────────────────────────────────
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Keep the package-index refresh and installation in one layer so the indexes
+# cannot become stale. BuildKit cache mounts retain downloaded packages and
+# APT metadata between builds without adding either to the image layer.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
       binutils build-essential clang clangd curl elixir erlang wget \
       fd-find file fzf gawk gnupg2 less libffi-dev libgmp-dev llvm-dev openjdk-21-jre-headless \
       php-cli php-mbstring php-xml rebar3 \
       libc6-dev libcurl4-openssl-dev libedit2 libgcc-13-dev libncurses-dev \
       libpython3-dev libsqlite3-0 libssl-dev libstdc++-13-dev libxml2-dev \
-      libz3-dev pkg-config procps python3-yaml ruby-full sqlite3 time tzdata unzip uuid-dev \
+      libz3-dev pkg-config procps python3-yaml ruby-full time tzdata unzip uuid-dev \
       xz-utils zlib1g-dev \
       libglib2.0-0t64 libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64 \
       libxcb1 libxkbcommon0 libasound2t64 libgbm1 libx11-6 libxext6 \
@@ -56,6 +64,29 @@ ENV BUN_INSTALL=/home/agent/.bun \
     GEM_PATH=/home/agent/.local/share/gem \
     ODIN_ROOT=/home/agent/.local/share/odin \
     PATH="/home/agent/.nvm/versions/node/default/bin:/home/agent/.local/bin:/home/agent/.cargo/bin:/home/agent/.ghcup/bin:/home/agent/.local/share/gem/bin:/home/agent/.local/share/swift/usr/bin:/home/agent/go/bin:/home/agent/.bun/bin:${PATH}"
+# ── Rust and Cargo ────────────────────────────────────────────────────────────
+RUN set -eu; \
+    case "$(uname -m)" in \
+      x86_64|amd64) RUST_TARGET=x86_64-unknown-linux-gnu ;; \
+      aarch64|arm64) RUST_TARGET=aarch64-unknown-linux-gnu ;; \
+      *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    tmpdir="$(mktemp -d)"; \
+    curl -fsSL "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${RUST_TARGET}/rustup-init" -o "$tmpdir/rustup-init"; \
+    curl -fsSL "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${RUST_TARGET}/rustup-init.sha256" -o "$tmpdir/rustup-init.sha256"; \
+    checksum="$(awk 'NR == 1 { print $1; exit }' "$tmpdir/rustup-init.sha256")"; \
+    if [ "${#checksum}" -ne 64 ]; then \
+      echo "invalid rustup-init checksum" >&2; exit 1; \
+    fi; \
+    case "$checksum" in *[!0-9a-fA-F]*) echo "invalid rustup-init checksum" >&2; exit 1 ;; esac; \
+    printf '%s  %s\n' "$checksum" "$tmpdir/rustup-init" > "$tmpdir/checksum"; \
+    sha256sum -c "$tmpdir/checksum"; \
+    chmod 0755 "$tmpdir/rustup-init"; \
+    CARGO_HOME=/home/agent/.cargo RUSTUP_HOME=/home/agent/.rustup "$tmpdir/rustup-init" \
+      -y --no-modify-path --profile minimal --default-toolchain "$RUST_VERSION"; \
+    /home/agent/.cargo/bin/rustc --version; \
+    /home/agent/.cargo/bin/cargo --version; \
+    rm -rf "$tmpdir"
 
 # ── uv (Python package manager for the pi kernel) ────────────────────────────
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -115,7 +146,8 @@ RUN unset NPM_CONFIG_PREFIX npm_config_prefix \
       graphql-language-service-cli@3.5.0 \
       @prisma/language-server@31.12.8 \
       vim-language-server@2.3.1 \
-      @olrtg/emmet-language-server@2.8.0
+      @olrtg/emmet-language-server@2.8.0 \
+      azure-pipelines-language-server@0.9.3
 RUN go install golang.org/x/tools/gopls@v0.23.0
 RUN uv tool install --no-cache basedpyright==1.40.1 \
     && uv tool install --no-cache python-lsp-server==1.15.0 \
@@ -192,24 +224,6 @@ RUN ARCH="$(uname -m)" && \
     omp --version && \
     rm -rf /home/agent/.omp
 
-# ── AWS CLI v2 (Amazon Bedrock provider) ─────────────────────────────────────
-# Two jobs: the browserless SSO device-code login, and `credential_process`.
-# omp reads the SSO access token but not the refresh token beside it, so it
-# cannot renew an expired session; the CLI can, and omp calls out to it.
-USER root
-RUN ARCH="$(uname -m)" && \
-    case "$ARCH" in \
-      aarch64|arm64) AWS_ARCH="aarch64" ;; \
-      x86_64|amd64)  AWS_ARCH="x86_64"  ;; \
-      *) echo "unsupported arch: $ARCH" >&2; exit 1 ;; \
-    esac && \
-    curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${AWS_ARCH}.zip" \
-      -o /tmp/awscli.zip && \
-    unzip -q /tmp/awscli.zip -d /tmp && \
-    /tmp/aws/install && \
-    rm -rf /tmp/awscli.zip /tmp/aws && \
-    aws --version
-USER agent
 
 # ── Docker image authorization ───────────────────────────────────────────────
 USER root
@@ -238,8 +252,7 @@ USER agent
 USER root
 COPY sbx-kit/omp-init.sh /usr/local/bin/omp-init.sh
 RUN chmod +x /usr/local/bin/omp-init.sh
-# omp-init.sh loads these only for a project that opts into Bedrock.
-COPY sbx-kit/extensions/ /opt/omp-sbx/extensions/
+COPY sbx-kit/omp-lsp/ /opt/omp-sbx/lsp/
 USER agent
 
 # ── Environment ──────────────────────────────────────────────────────────────

@@ -8,21 +8,84 @@ sandbox:
   image: "omp-sbx-configure:latest"
   entrypoint: ["/usr/local/bin/omp-configure-init"]
 
+credentials:
+  - service: anthropic
+    apiKey:
+      name: ANTHROPIC_API_KEY
+      proxyManaged: true
+      inject:
+        - domain: api.anthropic.com
+          header: x-api-key
+          format: "%s"
+  - service: openai
+    oauth:
+      tokenEndpoint:
+        host: auth.openai.com
+        path: /oauth/token
+      sentinels:
+        accessToken: oai-oat01-proxy-managed
+        refreshToken: oai-ort01-proxy-managed
+      resourceHosts:
+        - chatgpt.com
+  - service: google
+    apiKey:
+      name: GEMINI_API_KEY
+      proxyManaged: true
+      inject:
+        - domain: generativelanguage.googleapis.com
+          header: x-goog-api-key
+          format: "%s"
+  - service: groq
+    apiKey:
+      name: GROQ_API_KEY
+      proxyManaged: true
+      inject:
+        - domain: api.groq.com
+          header: Authorization
+          format: "Bearer %s"
+  - service: mistral
+    apiKey:
+      name: MISTRAL_API_KEY
+      proxyManaged: true
+      inject:
+        - domain: api.mistral.ai
+          header: Authorization
+          format: "Bearer %s"
+  - service: openrouter
+    apiKey:
+      name: OPENROUTER_API_KEY
+      proxyManaged: true
+      inject:
+        - domain: openrouter.ai
+          header: Authorization
+          format: "Bearer %s"
+  - service: xai
+    apiKey:
+      name: XAI_API_KEY
+      proxyManaged: true
+      inject:
+        - domain: api.x.ai
+          header: Authorization
+          format: "Bearer %s"
 permissions:
   network:
     allow:
+      - "api.anthropic.com:443"
+      - "generativelanguage.googleapis.com:443"
+      - "api.groq.com:443"
+      - "api.mistral.ai:443"
+      - "openrouter.ai:443"
+      - "api.x.ai:443"
       - "api.openai.com:443"
       - "auth.openai.com:443"
       - "chatgpt.com:443"
       - "*.opencode.ai:443"
       - "bedrock-runtime.us-east-1.amazonaws.com:443"
       - "bedrock.us-east-1.amazonaws.com:443"
-      - "oidc.us-east-1.amazonaws.com:443"
-      - "portal.sso.us-east-1.amazonaws.com:443"
-      - "sts.us-east-1.amazonaws.com:443"
       - "host.docker.internal:*"
 
 environment:
   variables:
     HOME: "/home/agent"
     PI_CONFIG_DIR: ".omp"
+    OPENAI_CODEX_OAUTH_TOKEN: "oai-oat01-proxy-managed"
